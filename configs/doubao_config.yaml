@@ -44,7 +44,7 @@ prompt:
   use_template_stochasticity: true    # Use random variations in templates for diversity
   template_variations:                # Different phrasings for parts of the template
     improvement_suggestion:
-      - "Here's how we could improve this code():"
+      - "Here's how we could improve this code:"
       - "I suggest the following improvements:"
       - "We can enhance this code by:"
 
@@ -137,8 +137,10 @@ evaluator:
   use_llm_feedback: false             # Use LLM to evaluate code quality
   llm_feedback_weight: 0.1            # Weight for LLM feedback in final score
 
+# —— 方向反馈 —— （保持你现有字段，同时新增 frequency）
 direction_feedback:
   enabled: true
+  frequency: 1          # ← 新增：每多少轮注入一次（1=每轮都注入）
   k_window: 8
   ema_decay: 0.8
   stagnation_k: 6
@@ -149,3 +151,12 @@ direction_feedback:
     latency_ms: 0.3
     flops: 0.2
     mem_mb: 0.2
+# —— 日志/落盘（可选，但强烈建议）——
+logging:
+  save_prompts_text: true         # 将每轮 user prompt 存成 txt，方便你核对
+  prompts_dir: openevolve_output/prompts
+
+# —— 其它与 sampler 行为相关的开关（若想看 evaluator 输出）——
+include_artifacts: true           # 已被 sampler 使用，控制是否拼 artifacts
+use_template_stochasticity: false # 关闭模板随机扰动，便于复现实验
+

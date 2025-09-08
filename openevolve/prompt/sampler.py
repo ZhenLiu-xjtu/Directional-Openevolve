@@ -60,6 +60,7 @@ class PromptSampler:
         diff_based_evolution: bool = True,
         template_key: Optional[str] = None,
         program_artifacts: Optional[Dict[str, Union[str, bytes]]] = None,
+        direction_guidance: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, str]:
         """
@@ -127,24 +128,42 @@ class PromptSampler:
         if self.config.use_template_stochasticity:
             user_template = self._apply_template_variations(user_template)
 
-        # NEW: Directional Feedback 来源的 program dict
-        parent_program_dict = kwargs.get("parent_program_dict")
-        # 回退：如果没显式传 parent_program_dict，就尝试用最近一次 previous_program
-        print("parent_program_dict:",parent_program_dict)
-        if not parent_program_dict and previous_programs:
-           parent_program_dict = previous_programs[-1]
-        # 生成 Directional Feedback 文本（可能为空串）
-        direction_feedback = ""
+            # --- Directional Feedback：组装最终可注入文本 ---
+            # 来源1：上游传入 direction_guidance
+            explicit_dir = (direction_guidance or "").strip()
 
-        try:
-            if parent_program_dict:
-                direction_feedback = _format_direction_feedback(parent_program_dict)
-                print("direction_feedback：",direction_feedback)
-                if direction_feedback:
-                    logger.info("DF preview: %s", direction_feedback.splitlines()[:5])
-        except Exception as _e:
-            logger.debug(f"direction_feedback formatting skipped: {_e}")
+            # 来源2：从 parent_program_dict/previous_programs 自动生成
+            parent_program_dict = kwargs.get("parent_program_dict")
+            if not parent_program_dict and previous_programs:
+                parent_program_dict = previous_programs[-1]
 
+            auto_dir = ""
+            try:
+                if parent_program_dict:
+                    # 调用实例方法（或静态方法，见下文B）
+                    auto_dir = self._format_direction_feedback(parent_program_dict).strip()
+                    if auto_dir:
+                        logger.info("DF preview (auto): %s", auto_dir.splitlines()[:5])
+            except Exception as _e:
+                logger.debug("direction_feedback formatting skipped: %s", _e)
+
+            # 优先用上游显式 guidance，其次用 auto 生成
+            merged_dir = explicit_dir if explicit_dir else auto_dir
+
+            # Gating：是否启用 + 注入频率（在 self.config 中读取）
+            df_cfg = getattr(self.config, "directional_feedback", {}) or {}
+            enabled = bool(df_cfg.get("enabled", False))
+            freq = int(df_cfg.get("frequency", 1) or 1)
+
+            # 演化轮次采用 build_prompt 的 evolution_round 入参
+            should_inject = enabled and merged_dir and (int(evolution_round) % freq  == 0)
+            # 统一封装成带标题的块（避免模板里再写标题）
+            if should_inject:
+                if not merged_dir.startswith("## "):
+                    merged_dir = f"## Directional Guidance\n{merged_dir}"
+                direction_block = merged_dir
+            else:
+                direction_block = ""
         # Format the final user message
         user_message = user_template.format(
             metrics=metrics_str,
@@ -153,9 +172,18 @@ class PromptSampler:
             current_program=current_program,
             language=language,
             artifacts=artifacts_section,
-            direction_feedback=direction_feedback,  # NEW: 注入占位符
+            direction_feedback=direction_block,  # NEW: 注入占位符
             **kwargs,
         )
+        # （可选）把当次 prompt 文本落盘（便于排查）
+        dump_cfg = getattr(self.config, "logging", {}) or {}
+        if dump_cfg.get("save_prompts_text", False):
+            import os, json
+            outdir = dump_cfg.get("prompts_dir", "openevolve_output/prompts")
+            os.makedirs(outdir, exist_ok=True)
+            fname = f"{outdir}/round_{int(evolution_round):05d}.txt"
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write(user_message)
 
         return {
             "system": system_message,
@@ -609,6 +637,7 @@ class PromptSampler:
         else:
             return ""
 
+
     def _safe_decode_artifact(self, value: Union[str, bytes]) -> str:
         """
         Safely decode an artifact value to string
@@ -664,25 +693,17 @@ class PromptSampler:
 
         return filtered
 
-    def _format_direction_feedback(program: dict) -> str:
+    def _format_direction_feedback(self, program: dict) -> str:
         md = (program or {}).get("metadata", {})
         slope = md.get("slope_on_baseline", None)
         target_vec = md.get("target_vec", None)
         if slope is None or target_vec is None:
             return ""
-
         action_hints = []
-        # 一个很简单的规则示例：平台期→建议小步探索、控参
         if md.get("stagnating", False):
-            action_hints.append("当前方向进入平台期：请尝试更小步长的结构性修改，限制参数与FLOPs的增长")
-
-        # 也可根据 target_vec 的资源维度倾向补充建议（演示写法）
-        # 例如 target_vec 的资源分量依旧偏大 → 再次提示控制资源
-        # 你可以结合 cfg.weights 进一步细化
-        hints_text = "；".join(action_hints) if action_hints else "保持当前改进方向，注意资源约束"
-
+            action_hints.append("Current direction entering platform phase: Please try smaller structural modifications to limit the growth of parameters and FLOPs")
+        hints_text = "；".join(action_hints) if action_hints else "Maintain the current improvement direction and pay attention to resource constraints"
         return (
-            "## Directional Feedback\n"
             f"- slope_on_island_baseline: {float(slope):.3f}\n"
             f"- hints: {hints_text}\n"
         )
