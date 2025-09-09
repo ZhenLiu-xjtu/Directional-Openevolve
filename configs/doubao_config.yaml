@@ -134,7 +134,7 @@ evaluator:
     - 0.9                             # Third stage threshold
 
   # Parallel evaluation
-  parallel_evaluations: 4             # Number of parallel evaluations
+  parallel_evaluations: 1             # Number of parallel evaluations
   # Note: distributed evaluation is not yet implemented
 
   # LLM-based feedback (experimental)

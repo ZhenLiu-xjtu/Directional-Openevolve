@@ -133,7 +133,7 @@ class PromptSampler:
             pid = p.get("id", f"insp_{i}")
             chg = (p.get("metadata", {}) or {}).get("changes", "N/A")
             lines.append(f"- {pid}: {chg}")
-        return "\n".oin(lines)
+        return "\n".join(lines)
 
     def _render_top_programs(self, top: List[Dict[str, Any]]) -> str:
         if not top:
@@ -259,7 +259,7 @@ class PromptSampler:
         lines: List[str] = []
         if merged_dir:
             lines.append(merged_dir.strip())
-        lines.append("- objective: 优先减少乘法次数 (MACs/FLOPs) 与推理时延")
+        lines.append("-Objective: Prioritize reducing the number of multiplications (MACs/FLOPs) and inference latency")
 
         allowed_ops = cfg_dir.get("allowed_ops", []) or []
         forbidden = cfg_dir.get("forbidden_patterns", []) or []
