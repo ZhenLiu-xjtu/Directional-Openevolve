@@ -141,20 +141,31 @@ evaluator:
   use_llm_feedback: false             # Use LLM to evaluate code quality
   llm_feedback_weight: 0.1            # Weight for LLM feedback in final score
 
-# —— 方向反馈 —— （保持你现有字段，同时新增 frequency）
+
 direction_feedback:
   enabled: true
   frequency: 1
+  warmup_k: 3
   k_window: 8
   ema_decay: 0.8
   stagnation_k: 6
   epsilon: 0.01
-  source: "evaluator"
+  max_df_lines: 12
+  allowed_ops:
+    - "tile_size ∈ {16,32}"
+    - "unroll ∈ {2,4,8}"
+    - "bias_outside_inner_loop"
+    - "accumulator_in_register"
+    - "addcmul_ (if allowed)"
+    - "vmap (if allowed)"
+  forbidden_patterns:
+    - "innermost loop over batch dimension"
+    - "python triple-for over non-contiguous memory"
   weights:
     score: 1.0
-    params: 0.3
-    latency_ms: 0.3
-    flops: 0.2
-    mem_mb: 0.2
+    latency_ms: 0.35
+    flops: 0.40
+    params: 0.15
+    mem_mb: 0.10
 
 

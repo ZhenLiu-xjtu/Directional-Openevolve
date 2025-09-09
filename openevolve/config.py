@@ -66,7 +66,7 @@ class LLMConfig(LLMModelConfig):
     # n-model configuration for evaluator LLM ensemble
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
 
-    # Backwardes compatibility with primary_model(_weight) options
+    # Backward compatibility with primary_model(_weight) options
     primary_model: str = None
     primary_model_weight: float = None
     secondary_model: str = None
@@ -76,7 +76,6 @@ class LLMConfig(LLMModelConfig):
         """Post-initialization to set up model configurations"""
         # Handle backward compatibility for primary_model(_weight) and secondary_model(_weight).
         if (self.primary_model or self.primary_model_weight) and len(self.models) < 1:
-            # Ensure we have a primary model
             self.models.append(LLMModelConfig())
         if self.primary_model:
             self.models[0].name = self.primary_model
@@ -84,7 +83,6 @@ class LLMConfig(LLMModelConfig):
             self.models[0].weight = self.primary_model_weight
 
         if (self.secondary_model or self.secondary_model_weight) and len(self.models) < 2:
-            # Ensure we have a second model
             self.models.append(LLMModelConfig())
         if self.secondary_model:
             self.models[1].name = self.secondary_model
@@ -116,14 +114,16 @@ class LLMConfig(LLMModelConfig):
                 if overwrite or getattr(model, key, None) is None:
                     setattr(model, key, value)
 
+
 # —— DirectionFeedback 的“权重”子配置 ——
 @dataclass
 class DirectionFeedbackWeights:
     score: float = 1.0
     params: float = 0.3
     latency_ms: float = 0.3
-    flops: float = 0.2
+    flops: float = 0.2       # 你可以把 FLOPs 理解为 MACs
     mem_mb: float = 0.2
+
 
 # —— DirectionFeedback 主配置（与 PromptConfig 同级） ——
 @dataclass
@@ -136,6 +136,20 @@ class DirectionFeedbackConfig:
     epsilon: float = 0.01           # 最小改进阈值
     source: Optional[str] = None    # 可选：指导来源标记（evaluator/db/llm等）
     weights: DirectionFeedbackWeights = field(default_factory=DirectionFeedbackWeights)
+
+    # === 新增：用于立即落地 ===
+    warmup_k: int = 3                              # 前 K 轮只收集数据，不更新方向
+    max_df_lines: int = 12                         # DF 文本的行数上限，防止挤爆 prompt
+    allowed_ops: List[str] = field(default_factory=lambda: [
+        "tile_size ∈ {16,32}", "unroll ∈ {2,4,8}",
+        "bias_outside_inner_loop", "accumulator_in_register",
+        "addcmul_ (if allowed)", "vmap (if allowed)"
+    ])
+    forbidden_patterns: List[str] = field(default_factory=lambda: [
+        "innermost loop over batch dimension",
+        "python triple-for over non-contiguous memory"
+    ])
+
 
 @dataclass
 class PromptConfig:
@@ -164,23 +178,13 @@ class PromptConfig:
     artifact_security_filter: bool = True
 
     # Feature extraction and program labeling
-    suggest_simplification_after_chars: Optional[int] = (
-        500  # Suggest simplifying if program exceeds this many characters
-    )
-    include_changes_under_chars: Optional[int] = (
-        100  # Include change descriptions in features if under this length
-    )
-    concise_implementation_max_lines: Optional[int] = (
-        10  # Label as "concise" if program has this many lines or fewer
-    )
-    comprehensive_implementation_min_lines: Optional[int] = (
-        50  # Label as "comprehensive" if program has this many lines or more
-    )
+    suggest_simplification_after_chars: Optional[int] = 500
+    include_changes_under_chars: Optional[int] = 100
+    concise_implementation_max_lines: Optional[int] = 10
+    comprehensive_implementation_min_lines: Optional[int] = 50
 
     # Backward compatibility - deprecated
-    code_length_threshold: Optional[int] = (
-        None  # Deprecated: use suggest_simplification_after_chars
-    )
+    code_length_threshold: Optional[int] = None
 
 
 @dataclass
@@ -206,21 +210,20 @@ class DatabaseConfig:
     diversity_metric: str = "edit_distance"  # Options: "edit_distance", "feature_based"
 
     # Feature map dimensions for MAP-Elites
-    # Default to complexity and diversity for better exploration
     feature_dimensions: List[str] = field(default_factory=lambda: ["complexity", "diversity"])
-    feature_bins: Union[int, Dict[str, int]] = 10  # Can be int (all dims) or dict (per-dim)
-    diversity_reference_size: int = 20  # Size of reference set for diversity calculation
+    feature_bins: Union[int, Dict[str, int]] = 10
+    diversity_reference_size: int = 20
 
     # Migration parameters for island-based evolution
-    migration_interval: int = 50  # Migrate every N generations
-    migration_rate: float = 0.1  # Fraction of population to migrate
+    migration_interval: int = 50
+    migration_rate: float = 0.1
 
     # Random seed for reproducible sampling
     random_seed: Optional[int] = 42
 
     # Artifact storage
-    artifacts_base_path: Optional[str] = None  # Defaults to db_path/artifacts
-    artifact_size_threshold: int = 32 * 1024  # 32KB threshold
+    artifacts_base_path: Optional[str] = None
+    artifact_size_threshold: int = 32 * 1024
     cleanup_old_artifacts: bool = True
     artifact_retention_days: int = 30
 
@@ -230,7 +233,7 @@ class EvaluatorConfig:
     """Configuration for program evaluation"""
 
     # General settings
-    timeout: int = 300  # Maximum evaluation time in seconds
+    timeout: int = 300
     max_retries: int = 3
 
     # Resource limits for evaluation
@@ -251,7 +254,7 @@ class EvaluatorConfig:
 
     # Artifact handling
     enable_artifacts: bool = True
-    max_artifact_storage: int = 100 * 1024 * 1024  # 100MB per program
+    max_artifact_storage: int = 100 * 1024 * 1024
 
 
 @dataclass
@@ -288,47 +291,45 @@ class Config:
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
         """Create configuration from a dictionary"""
-        # Handle nested configurations
         config = Config()
 
         # Update top-level fields
         for key, value in config_dict.items():
-            if key not in ["llm", "prompt", "database", "evaluator"] and hasattr(config, key):
+            if key not in ["llm", "prompt", "database", "evaluator",
+                           "direction_feedback", "directional_feedback"] and hasattr(config, key):
                 setattr(config, key, value)
 
-        # Update nested configs
+        # Nested configs
         if "llm" in config_dict:
             llm_dict = config_dict["llm"]
             if "models" in llm_dict:
                 llm_dict["models"] = [LLMModelConfig(**m) for m in llm_dict["models"]]
             if "evaluator_models" in llm_dict:
-                llm_dict["evaluator_models"] = [
-                    LLMModelConfig(**m) for m in llm_dict["evaluator_models"]
-                ]
+                llm_dict["evaluator_models"] = [LLMModelConfig(**m) for m in llm_dict["evaluator_models"]]
             config.llm = LLMConfig(**llm_dict)
+
         if "prompt" in config_dict:
             config.prompt = PromptConfig(**config_dict["prompt"])
+
         if "database" in config_dict:
             config.database = DatabaseConfig(**config_dict["database"])
 
-
-        # —— Direction Feedback（支持两个别名）——
-        df_key = None
-        if "direction_feedback" in config_dict:
-            df_key = "direction_feedback"
-        elif "directional_feedback" in config_dict:
-            df_key = "directional_feedback"
-
+        # —— Direction Feedback（支持两个别名 + 过滤未知键）——
+        df_key = "direction_feedback" if "direction_feedback" in config_dict else \
+                 ("directional_feedback" if "directional_feedback" in config_dict else None)
         if df_key:
             df_dict = dict(config_dict[df_key] or {})
+            # 过滤未知键，避免把 logging 等塞进来
+            allowed = set(DirectionFeedbackConfig.__dataclass_fields__.keys())
+            df_dict = {k: v for k, v in df_dict.items() if k in allowed}
             # 处理 weights 子字典
             if "weights" in df_dict and isinstance(df_dict["weights"], dict):
                 df_dict["weights"] = DirectionFeedbackWeights(**df_dict["weights"])
             config.direction_feedback = DirectionFeedbackConfig(**df_dict)
 
-        # Ensure database inherits the random seed if not explicitly set
         if config.database.random_seed is None and config.random_seed is not None:
             config.database.random_seed = config.random_seed
+
         if "evaluator" in config_dict:
             config.evaluator = EvaluatorConfig(**config_dict["evaluator"])
 
@@ -363,9 +364,6 @@ class Config:
                 "num_diverse_programs": self.prompt.num_diverse_programs,
                 "use_template_stochasticity": self.prompt.use_template_stochasticity,
                 "template_variations": self.prompt.template_variations,
-                # Note: meta-prompting features not implemented
-                # "use_meta_prompting": self.prompt.use_meta_prompting,
-                # "meta_prompt_weight": self.prompt.meta_prompt_weight,
             },
             "database": {
                 "db_path": self.database.db_path,
@@ -376,8 +374,6 @@ class Config:
                 "elite_selection_ratio": self.database.elite_selection_ratio,
                 "exploration_ratio": self.database.exploration_ratio,
                 "exploitation_ratio": self.database.exploitation_ratio,
-                # Note: diversity_metric fixed to "edit_distance"
-                # "diversity_metric": self.database.diversity_metric,
                 "feature_dimensions": self.database.feature_dimensions,
                 "feature_bins": self.database.feature_bins,
                 "migration_interval": self.database.migration_interval,
@@ -388,20 +384,17 @@ class Config:
             "evaluator": {
                 "timeout": self.evaluator.timeout,
                 "max_retries": self.evaluator.max_retries,
-                # Note: resource limits not implemented
-                # "memory_limit_mb": self.evaluator.memory_limit_mb,
-                # "cpu_limit": self.evaluator.cpu_limit,
                 "cascade_evaluation": self.evaluator.cascade_evaluation,
                 "cascade_thresholds": self.evaluator.cascade_thresholds,
                 "parallel_evaluations": self.evaluator.parallel_evaluations,
-                # Note: distributed evaluation not implemented
-                # "distributed": self.evaluator.distributed,
                 "use_llm_feedback": self.evaluator.use_llm_feedback,
                 "llm_feedback_weight": self.evaluator.llm_feedback_weight,
             },
             # Evolution settings
             "diff_based_evolution": self.diff_based_evolution,
             "max_code_length": self.max_code_length,
+
+            # Direction Feedback（完整导出）
             "direction_feedback": {
                 "enabled": self.direction_feedback.enabled,
                 "frequency": self.direction_feedback.frequency,
@@ -410,6 +403,10 @@ class Config:
                 "stagnation_k": self.direction_feedback.stagnation_k,
                 "epsilon": self.direction_feedback.epsilon,
                 "source": self.direction_feedback.source,
+                "warmup_k": self.direction_feedback.warmup_k,
+                "max_df_lines": self.direction_feedback.max_df_lines,
+                "allowed_ops": self.direction_feedback.allowed_ops,
+                "forbidden_patterns": self.direction_feedback.forbidden_patterns,
                 "weights": {
                     "score": self.direction_feedback.weights.score,
                     "params": self.direction_feedback.weights.params,
@@ -418,7 +415,6 @@ class Config:
                     "mem_mb": self.direction_feedback.weights.mem_mb,
                 },
             },
-
         }
 
     def to_yaml(self, path: Union[str, Path]) -> None:
@@ -433,14 +429,10 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
         config = Config.from_yaml(config_path)
     else:
         config = Config()
-
-        # Use environment variables if available
         api_key = os.environ.get("OPENAI_API_KEY")
         api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
-
         config.llm.update_model_params({"api_key": api_key, "api_base": api_base})
 
-    # Make the system message available to the individual models, in case it is not provided from the prompt sampler
+    # Make the system message available to the individual models
     config.llm.update_model_params({"system_message": config.prompt.system_message})
-
     return config

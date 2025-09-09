@@ -26,8 +26,8 @@ class PromptSampler:
     - task/context blocks
     - top programs / inspirations
     - execution artifacts (optional)
-    - error feedback (if any, from caller)
-    - directional feedback (this class reads from `direction_cfg`, not PromptConfig)
+    - evaluator improvement hints
+    - directional feedback (reads from `direction_cfg`, not PromptConfig)
     """
 
     def __init__(self, config: PromptConfig, direction_cfg: Optional[object] = None) -> None:
@@ -40,7 +40,6 @@ class PromptSampler:
         self.direction_cfg = direction_cfg
         self.template_manager = TemplateManager(config.template_dir)
 
-        # which system/user template keys to use (can be overridden by set_templates)
         self._system_template_key = "system_message"
         self._user_template_key_diff = "diff_user"
         self._user_template_key_full = "full_rewrite_user"
@@ -100,23 +99,26 @@ class PromptSampler:
         if self.config.include_artifacts and program_artifacts:
             artifacts_section = self._render_artifacts(program_artifacts)
 
-        # 4) template stochasticity (variations) — only affects wording, not which blocks appear
+        # 4) variations
         if self.config.use_template_stochasticity:
             user_template = self._apply_template_variations(user_template)
 
-        # 5) Directional Feedback: merge explicit + auto, then gate by direction_cfg
+        # 5) auto improvement areas
+        improvement_areas = self._render_improvement_areas(program_metrics, previous_programs)
+
+        # 6) Directional Feedback
         direction_block = self._build_direction_block(
             evolution_round=evolution_round,
             previous_programs=previous_programs,
             parent_program_dict=parent_program_dict,
             direction_guidance=direction_guidance,
+            program_metrics=program_metrics,
         )
 
-        # 6) render user prompt
-        # NOTE: keep placeholders conservative; these are present in your templates.py
+        # 7) render user prompt
         user_message = user_template.format(
             metrics=metrics_str,
-            improvement_areas="",  # reserved; caller can pass in via kwargs if needed
+            improvement_areas=improvement_areas,
             evolution_history=evolution_history,
             current_program=current_program,
             language=language,
@@ -127,10 +129,10 @@ class PromptSampler:
             **kwargs,
         )
 
-        # 7) system prompt
+        # 8) system prompt
         system_message = system_template
 
-        # 8) optional: dump final user prompt (plain text) for debugging/inspection
+        # 9) dump final user prompt (optional)
         if getattr(self.config, "save_prompts_text", False):
             outdir = self.config.prompts_dir or "openevolve_output/prompts"
             try:
@@ -141,14 +143,7 @@ class PromptSampler:
             except Exception as _e:
                 logger.debug("Failed to dump prompt text: %s", _e)
 
-        # 9) log a compact preview (avoids flooding)
-        logger.info(
-            "[Prompt] round=%s user_template=%s sampler=%s",
-            evolution_round,
-            user_template_key,
-            __file__,
-        )
-
+        logger.info("[Prompt] round=%s user_template=%s sampler=%s", evolution_round, user_template_key, __file__)
         return {"system": system_message, "user": user_message}
 
     # --------------------------------------------------------------------- #
@@ -158,7 +153,6 @@ class PromptSampler:
         if not metrics:
             return ""
         try:
-            # deterministic ordering for readability
             keys = sorted(metrics.keys())
             parts = []
             for k in keys:
@@ -169,14 +163,12 @@ class PromptSampler:
                     parts.append(f"{k}={v}")
             return ", ".join(parts)
         except Exception:
-            # Safe fallback
             return json.dumps(metrics, ensure_ascii=False)
 
     def _render_history(self, prev: List[Dict[str, Any]]) -> str:
         if not prev:
             return ""
         lines = []
-        # only take a few recent to avoid bloating prompt
         for i, p in enumerate(prev[-5:]):
             pid = p.get("id", f"prog_{i}")
             pm = p.get("metrics", {}) or {}
@@ -184,7 +176,6 @@ class PromptSampler:
             if cs is not None:
                 lines.append(f"- {pid}: combined_score={cs:.6f}")
             else:
-                # no score => make visible to LLM that it's missing
                 lines.append(f"- {pid}: (no combined_score)")
         return "\n".join(lines)
 
@@ -216,31 +207,74 @@ class PromptSampler:
 
     def _render_artifacts(self, artifacts: Dict[str, Any]) -> str:
         """
-        Render execution artifacts with a size cap and a simple security filter (optional).
+        先给 2–3 行摘要，再给截断后的 Raw。
         """
+        def summarize(text: str) -> List[str]:
+            lines = text.splitlines()
+            keys = ("slow path", "python loop", "inefficient", "timeout", "OOM", "error", "warning")
+            hit = [ln for ln in lines if any(k.lower() in ln.lower() for k in keys)]
+            return hit[:3] if hit else lines[:2]
+
         try:
-            blob = json.dumps(artifacts, ensure_ascii=False)
+            blob = json.dumps(artifacts, ensure_ascii=False, indent=2)
         except Exception:
             blob = str(artifacts)
 
+        summary = summarize(blob)
+        summary_txt = "\n".join(f"- {s}" for s in summary)
+
         if self.config.artifact_security_filter:
-            # minimal redaction (paths, tokens, etc.) – keep it simple & safe
             blob = blob.replace(self._safe_home(), "~")
 
         max_bytes = int(self.config.max_artifact_bytes or 0)
         if max_bytes > 0 and len(blob.encode("utf-8")) > max_bytes:
-            # trim from the head to keep recent errors/outputs
             enc = blob.encode("utf-8")
             blob = enc[-max_bytes:].decode("utf-8", errors="ignore")
             blob = "[TRUNCATED ARTIFACTS]\n" + blob
 
-        return blob
+        return f"Summary:\n{summary_txt}\n\nRaw:\n{blob}"
 
     def _safe_home(self) -> str:
         try:
             return os.path.expanduser("~")
         except Exception:
             return "/home/user"
+
+    # --------------------------------------------------------------------- #
+    # Improvement areas（自动 1–3 条）
+    # --------------------------------------------------------------------- #
+    def _render_improvement_areas(self, program_metrics: dict, previous_programs: list) -> str:
+        tips = []
+        if not program_metrics:
+            return ""
+
+        last = None
+        if previous_programs:
+            last = (previous_programs[-1] or {}).get("metrics", {}) or {}
+
+        cs   = program_metrics.get("combined_score")
+        macs = program_metrics.get("macs", program_metrics.get("flops"))
+        params = program_metrics.get("params")
+        lat_ms = program_metrics.get("latency_ms", program_metrics.get("infer_time_s", 0) * 1000.0)
+
+        if last:
+            d_cs   = (cs - last.get("combined_score")) if (cs is not None and "combined_score" in last) else None
+            d_macs = (macs - last.get("macs", last.get("flops", 0))) if (macs is not None) else None
+            d_lat  = (lat_ms - (last.get("latency_ms", last.get("infer_time_s", 0) * 1000.0)))
+            d_params = (params - last.get("params", 0)) if (params is not None) else None
+
+            if (d_lat is not None and d_lat > 0) and (d_macs is not None and abs(d_macs) < 0.02 * (macs + 1e-9)):
+                tips.append("推理时间上升但 MACs 基本不变：避免将 batch 维作为最内层循环，优先对连续维做 tile+unroll。")
+
+            if (d_macs is not None and d_macs > 0) and (d_cs is not None and d_cs <= 0):
+                tips.append("乘法次数增加但精度无提升：尝试低秩/分组/逐点分解或共享中间乘积，减少 MACs。")
+
+            if (d_params is not None and d_params > 0.05 * (params + 1e-9)):
+                tips.append("参数增长过快：限制新增层宽度或改为分块累加，避免参数体积膨胀。")
+
+        if not tips:
+            tips.append("优先优化速度与乘法：小 tile (16/32) + 低阶 unroll (2/4/8)，内层循环避开 batch 维。")
+        return "\n".join(f"- {t}" for t in tips)
 
     # --------------------------------------------------------------------- #
     # Directional Feedback helpers
@@ -252,15 +286,14 @@ class PromptSampler:
         previous_programs: List[Dict[str, Any]],
         parent_program_dict: Optional[Dict[str, Any]],
         direction_guidance: Optional[str],
+        program_metrics: Optional[Dict[str, Any]],
     ) -> str:
         """
         Merge explicit guidance with auto-generated hints from program metadata,
         then inject based on direction_cfg.enabled/frequency.
         """
-        # 1) collect candidate text
         explicit_dir = (direction_guidance or "").strip()
 
-        # if parent not provided, take the last of previous as a fallback
         if not parent_program_dict and previous_programs:
             parent_program_dict = previous_programs[-1]
 
@@ -275,7 +308,7 @@ class PromptSampler:
 
         merged_dir = explicit_dir if explicit_dir else auto_dir
 
-        # 2) read direction config (dataclass or dict → dict)
+        # read cfg (dataclass or dict → dict)
         cfg_dir: Dict[str, Any] = {}
         if self.direction_cfg is not None:
             if isinstance(self.direction_cfg, dict):
@@ -288,25 +321,36 @@ class PromptSampler:
 
         enabled = bool(cfg_dir.get("enabled", False))
         freq = int(cfg_dir.get("frequency", 1) or 1)
+        max_lines = int(cfg_dir.get("max_df_lines", 12))
 
         logger.info(
             "[DIRFB] enabled=%s freq=%s explicit_len=%d auto_len=%d (sampler=%s)",
-            enabled,
-            freq,
-            len(explicit_dir),
-            len(auto_dir),
-            __file__,
+            enabled, freq, len(explicit_dir), len(auto_dir), __file__,
         )
 
-        # 3) gating
-        should_inject = bool(enabled and merged_dir and (int(evolution_round) % freq == 0))
+        should_inject = bool(enabled and (int(evolution_round) % freq == 0))
         if not should_inject:
             return ""
 
-        # Ensure block has a header – templates expect just {direction_feedback}
-        if not merged_dir.startswith("## "):
-            return "## Directional Guidance\n" + merged_dir
-        return merged_dir
+        # 组装输出：数值/自动块 + 目标 + 允许/禁止清单（强调减少乘法/提速）
+        lines: List[str] = []
+
+        # warmup/空文本：也给动作目标
+        if merged_dir:
+            lines.append(merged_dir.strip())
+        lines.append("- objective: 优先减少乘法次数 (MACs/FLOPs) 与推理时延")
+
+        allowed_ops = cfg_dir.get("allowed_ops", []) or []
+        forbidden = cfg_dir.get("forbidden_patterns", []) or []
+        if allowed_ops:
+            lines.append("**Allowed knobs/ops:** " + ", ".join(allowed_ops))
+        if forbidden:
+            lines.append("**Forbidden patterns:** " + ", ".join(forbidden))
+
+        text = "\n".join(lines[:max_lines])
+        if not text.startswith("## "):
+            text = "## Directional Guidance\n" + text
+        return text
 
     def _format_direction_feedback(self, program: Dict[str, Any]) -> str:
         """
@@ -318,8 +362,16 @@ class PromptSampler:
         slope = md.get("slope_on_baseline", None)
         slope_avg = md.get("slope_mean_k", None)
         stagnating = md.get("stagnating", None)
+        warmup = md.get("warmup", False)
+        invalid = md.get("invalid", False)
 
         lines: List[str] = []
+
+        if warmup:
+            lines.append("- WARMUP: collecting statistics; real direction will start after warmup_k")
+        if invalid:
+            lines.append("- INVALID: this round not used for direction update")
+
         if slope is not None:
             try:
                 lines.append(f"- slope_on_island_baseline: {float(slope):.3f}")
@@ -335,10 +387,9 @@ class PromptSampler:
         if stagnating is not None:
             lines.append(f"- stagnating: {bool(stagnating)}")
 
-        # lightweight action hint
-        if stagnating:
+        if stagnating and not warmup and not invalid:
             lines.append("- hint: plateau detected → try smaller-step structural edits; constrain params/FLOPs")
-        else:
+        elif not warmup and not invalid:
             lines.append("- hint: maintain direction; watch resource constraints")
 
         return "\n".join(lines).strip()
@@ -347,12 +398,8 @@ class PromptSampler:
     # template variations
     # --------------------------------------------------------------------- #
     def _apply_template_variations(self, template: str) -> str:
-        """
-        Apply small word-level variations to reduce overfitting to a single phrasing.
-        """
         try:
             variations = self.config.template_variations or {}
-            # only one key right now ("improvement_suggestion"), easy to extend later
             if "improvement_suggestion" in variations:
                 choices = variations["improvement_suggestion"]
                 if isinstance(choices, list) and choices:
