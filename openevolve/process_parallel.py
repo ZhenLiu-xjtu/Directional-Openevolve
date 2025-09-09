@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
 
+# provide a module-wide alias to avoid shadowing in inner scopes
+dc_asdict = asdict
+
 logger = logging.getLogger(__name__)
 
 # === Directional Feedback globals (safe imports) ===
@@ -32,7 +35,6 @@ except Exception:
 _worker_direction_cfg = None
 _worker_running_stats = None
 _worker_dir_tracker = None
-
 
 
 @dataclass
@@ -56,10 +58,8 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
-    # ✅ 统一在函数最前声明所有会赋值的全局变量
-
     global _worker_direction_cfg, _worker_running_stats, _worker_dir_tracker
-    # Store config for later use
+
     # Reconstruct Config object from nested dictionaries
     from openevolve.config import (
         Config,
@@ -68,6 +68,7 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
         LLMConfig,
         PromptConfig,
         LLMModelConfig,
+        DirectionFeedbackConfig,
     )
 
     # Reconstruct model objects
@@ -85,37 +86,46 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     database_config = DatabaseConfig(**config_dict["database"])
     evaluator_config = EvaluatorConfig(**config_dict["evaluator"])
 
+    # Direction feedback: rebuild dataclass & dict view
+    raw_df = config_dict.get("direction_feedback", None)
+    if isinstance(raw_df, dict):
+        df_obj = DirectionFeedbackConfig(**raw_df)
+    elif isinstance(raw_df, DirectionFeedbackConfig):
+        df_obj = raw_df
+    else:
+        df_obj = DirectionFeedbackConfig()  # 默认关闭
+
+    _worker_direction_cfg = dc_asdict(df_obj)
+
     _worker_config = Config(
         llm=llm_config,
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
+        direction_feedback=df_obj,  # 强类型对象，便于属性访问
         **{
             k: v
             for k, v in config_dict.items()
-            if k not in ["llm", "prompt", "database", "evaluator"]
+            if k not in ["llm", "prompt", "database", "evaluator", "direction_feedback"]
         },
     )
     _worker_evaluation_file = evaluation_file
-
-
 
     # These will be lazily initialized on first use
     _worker_evaluator = None
     _worker_llm_ensemble = None
     _worker_prompt_sampler = None
-    # === Directional Feedback: store config & initialize placeholders ===
 
-    _worker_direction_cfg = config_dict.get("direction_feedback", {}) or {}
-    # 只有打开开关且模块可用才启用
+    # 只有打开开关且模块可用才启用 RunningStats
     if _worker_direction_cfg.get("enabled", False) and RunningStats is not None:
         _worker_running_stats = RunningStats(
-            mean={"combined_score":0, "params":0, "latency_ms":0, "flops":0, "mem_mb":0},
-            std ={"combined_score":1, "params":1, "latency_ms":1, "flops":1, "mem_mb":1},
+            mean={"combined_score": 0, "params": 0, "latency_ms": 0, "flops": 0, "mem_mb": 0},
+            std={"combined_score": 1, "params": 1, "latency_ms": 1, "flops": 1, "mem_mb": 1},
             count=0,
         )
     else:
         _worker_running_stats = None
+
     _worker_dir_tracker = None  # 真正创建放在 lazy 初始化
 
 
@@ -124,7 +134,8 @@ def _lazy_init_worker_components():
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
-    global _worker_dir_tracker, _worker_direction_cfg  # ✅ 新增
+    global _worker_dir_tracker, _worker_direction_cfg
+
     if _worker_llm_ensemble is None:
         from openevolve.llm.ensemble import LLMEnsemble
 
@@ -133,7 +144,8 @@ def _lazy_init_worker_components():
     if _worker_prompt_sampler is None:
         from openevolve.prompt.sampler import PromptSampler
 
-        _worker_prompt_sampler = PromptSampler(_worker_config.prompt)
+        _worker_prompt_sampler = PromptSampler(_worker_config.prompt,
+                                               _worker_config.direction_feedback)
 
     if _worker_evaluator is None:
         from openevolve.evaluator import Evaluator
@@ -187,11 +199,7 @@ def _run_iteration_worker(
         # Sort by metrics for top programs
         from openevolve.utils.metrics_utils import safe_numeric_average
 
-        # island_programs.sort(
-        #     key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
-        #     reverse=True,
-        # )
-        # === PATCH BEGIN: 禁用“均值退化”，缺失 combined_score 视为 -inf ===
+        # === 禁用“均值兜底”，缺失 combined_score 视为 -inf，排序更稳定 ===
         def _score_key(p):
             m = p.metrics or {}
             return m["combined_score"] if "combined_score" in m else float("-inf")
@@ -265,10 +273,10 @@ def _run_iteration_worker(
 
         child_id = str(uuid.uuid4())
         child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
-        # === PATCH BEGIN: 规范化 child_metrics，缺失分数时强制极低分 ===
+
+        # 规范化 child_metrics，缺失分数时强制极低分
         try:
             if "combined_score" not in child_metrics:
-                # 不再用均值兜底，直接判极低分并打标记
                 child_metrics = dict(child_metrics)  # 复制，避免影响底层返回
                 child_metrics["combined_score"] = -1e9
                 child_metrics["invalid_missing_score"] = 1.0
@@ -278,7 +286,6 @@ def _run_iteration_worker(
                 )
         except Exception as _e:
             logger.warning("Failed to normalize child_metrics for %s: %s", child_id, _e)
-        # === PATCH END ===
 
         # === Directional Feedback: compute vectors & slope (before creating child Program) ===
         dir_md = {}
@@ -290,17 +297,17 @@ def _run_iteration_worker(
                 and _worker_dir_tracker is not None
             ):
                 weights = _worker_direction_cfg.get("weights", {}) or {}
-                # 兼容字段名（latency/latency_ms, flops/FLOPs 等在 target_space 里已做兼容）
                 v_parent = make_target_vector(parent.metrics, _worker_running_stats, weights)
-                v_child  = make_target_vector(child_metrics,  _worker_running_stats, weights)
+                v_child = make_target_vector(child_metrics, _worker_running_stats, weights)
 
-                # 是否改进：优先按 combined_score，否则退化为平均数
-                from openevolve.utils.metrics_utils import safe_numeric_average
-                # === PATCH BEGIN: DF 改进判定也禁用“均值退化” ===
-                parent_cs = parent.metrics["combined_score"] if "combined_score" in parent.metrics else float("-inf")
-                child_cs = child_metrics["combined_score"] if "combined_score" in child_metrics else float("-inf")
+                # 是否改进（禁用均值兜底）
+                parent_cs = parent.metrics["combined_score"] if "combined_score" in parent.metrics else float(
+                    "-inf"
+                )
+                child_cs = child_metrics["combined_score"] if "combined_score" in child_metrics else float(
+                    "-inf"
+                )
                 improved = child_cs > parent_cs
-                # === PATCH END ===
 
                 dv, slope, slope_avg, st = _worker_dir_tracker.update(
                     island_id=parent_island, v_parent=v_parent, v_child=v_child, improved=improved
@@ -323,7 +330,6 @@ def _run_iteration_worker(
                 )
         except Exception as _e:
             logger.warning(f"[dirfb] skipped due to error: {_e}")
-
 
         # Get artifacts
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
@@ -408,15 +414,19 @@ class ProcessParallelController:
             "language": config.language,
         }
 
-        # ✅ 单独加一项 direction_feedback，不塞进 Config
-        if hasattr(config, "direction_feedback"):
-            cfg_dict["direction_feedback"] = config.direction_feedback
+        # serialize direction_feedback as dict for worker
+        if hasattr(config, "direction_feedback") and config.direction_feedback is not None:
+            try:
+                cfg_dict["direction_feedback"] = dc_asdict(config.direction_feedback)
+            except Exception:
+                df = config.direction_feedback
+                cfg_dict["direction_feedback"] = getattr(df, "__dict__", {})
+
         return cfg_dict
 
     def start(self) -> None:
         """Start the process pool"""
         # Convert config to dict for pickling
-        # We need to be careful with nested dataclasses
         config_dict = self._serialize_config(self.config)
 
         # Create process pool with initializer
@@ -530,7 +540,7 @@ class ProcessParallelController:
                 elif result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
-
+                    child_program.metadata = child_program.metadata or {}
                     # Add to database
                     self.database.add(child_program, iteration=completed_iteration)
 
@@ -586,31 +596,12 @@ class ProcessParallelController:
                         )
                         logger.info(f"Metrics: {metrics_str}")
 
-                        # Check if this is the first program without combined_score
-                        if not hasattr(self, "_warned_about_combined_score"):
-                            self._warned_about_combined_score = False
-
-                        if (
-                            "combined_score" not in child_program.metrics
-                            and not self._warned_about_combined_score
-                        ):
-                            from openevolve.utils.metrics_utils import safe_numeric_average
-
-                            avg_score = safe_numeric_average(child_program.metrics)
-                            logger.warning(
-                                f"⚠️  No 'combined_score' metric found in evaluation results. "
-                                f"Using average of all numeric metrics ({avg_score:.4f}) for evolution guidance. "
-                                f"For better evolution results, please modify your evaluator to return a 'combined_score' "
-                                f"metric that properly weights different aspects of program performance."
+                        # Check for new best
+                        if self.database.best_program_id == child_program.id:
+                            logger.info(
+                                f"🌟 New best solution found at iteration {completed_iteration}: "
+                                f"{child_program.id}"
                             )
-                            self._warned_about_combined_score = True
-
-                    # Check for new best
-                    if self.database.best_program_id == child_program.id:
-                        logger.info(
-                            f"🌟 New best solution found at iteration {completed_iteration}: "
-                            f"{child_program.id}"
-                        )
 
                     # Checkpoint callback
                     # Don't checkpoint at iteration 0 (that's just the initial program)

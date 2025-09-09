@@ -116,11 +116,32 @@ class LLMConfig(LLMModelConfig):
                 if overwrite or getattr(model, key, None) is None:
                     setattr(model, key, value)
 
+# —— DirectionFeedback 的“权重”子配置 ——
+@dataclass
+class DirectionFeedbackWeights:
+    score: float = 1.0
+    params: float = 0.3
+    latency_ms: float = 0.3
+    flops: float = 0.2
+    mem_mb: float = 0.2
+
+# —— DirectionFeedback 主配置（与 PromptConfig 同级） ——
+@dataclass
+class DirectionFeedbackConfig:
+    enabled: bool = False           # 是否开启方向注入
+    frequency: int = 1              # 每 N 轮注入一次（1=每轮）
+    k_window: int = 8               # 方向估计的滑窗
+    ema_decay: float = 0.8          # EMA 衰减系数
+    stagnation_k: int = 6           # 平台期判定窗口
+    epsilon: float = 0.01           # 最小改进阈值
+    source: Optional[str] = None    # 可选：指导来源标记（evaluator/db/llm等）
+    weights: DirectionFeedbackWeights = field(default_factory=DirectionFeedbackWeights)
 
 @dataclass
 class PromptConfig:
     """Configuration for prompt generation"""
-
+    save_prompts_text: Optional[bool] = False
+    prompts_dir: Optional[str] = None
     template_dir: Optional[str] = None
     system_message: str = "system_message"
     evaluator_system_message: str = "evaluator_system_message"
@@ -251,6 +272,8 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
 
+    direction_feedback: DirectionFeedbackConfig = field(default_factory=DirectionFeedbackConfig)
+
     # Evolution settings
     diff_based_evolution: bool = True
     max_code_length: int = 10000
@@ -287,6 +310,21 @@ class Config:
             config.prompt = PromptConfig(**config_dict["prompt"])
         if "database" in config_dict:
             config.database = DatabaseConfig(**config_dict["database"])
+
+
+        # —— Direction Feedback（支持两个别名）——
+        df_key = None
+        if "direction_feedback" in config_dict:
+            df_key = "direction_feedback"
+        elif "directional_feedback" in config_dict:
+            df_key = "directional_feedback"
+
+        if df_key:
+            df_dict = dict(config_dict[df_key] or {})
+            # 处理 weights 子字典
+            if "weights" in df_dict and isinstance(df_dict["weights"], dict):
+                df_dict["weights"] = DirectionFeedbackWeights(**df_dict["weights"])
+            config.direction_feedback = DirectionFeedbackConfig(**df_dict)
 
         # Ensure database inherits the random seed if not explicitly set
         if config.database.random_seed is None and config.random_seed is not None:
@@ -364,6 +402,23 @@ class Config:
             # Evolution settings
             "diff_based_evolution": self.diff_based_evolution,
             "max_code_length": self.max_code_length,
+            "direction_feedback": {
+                "enabled": self.direction_feedback.enabled,
+                "frequency": self.direction_feedback.frequency,
+                "k_window": self.direction_feedback.k_window,
+                "ema_decay": self.direction_feedback.ema_decay,
+                "stagnation_k": self.direction_feedback.stagnation_k,
+                "epsilon": self.direction_feedback.epsilon,
+                "source": self.direction_feedback.source,
+                "weights": {
+                    "score": self.direction_feedback.weights.score,
+                    "params": self.direction_feedback.weights.params,
+                    "latency_ms": self.direction_feedback.weights.latency_ms,
+                    "flops": self.direction_feedback.weights.flops,
+                    "mem_mb": self.direction_feedback.weights.mem_mb,
+                },
+            },
+
         }
 
     def to_yaml(self, path: Union[str, Path]) -> None:

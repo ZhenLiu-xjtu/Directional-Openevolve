@@ -32,6 +32,10 @@ llm:
 
 # Prompt configuration
 prompt:
+  # 新增：建议把这两项放在 prompt 下
+  save_prompts_text: true
+  prompts_dir: "openevolve_output/prompts"
+
   template_dir: null                  # Custom directory for prompt templates
   system_message: "You are an expert coder helping to improve programs through evolution."
   evaluator_system_message: "You are an expert code reviewer."
@@ -140,23 +144,17 @@ evaluator:
 # —— 方向反馈 —— （保持你现有字段，同时新增 frequency）
 direction_feedback:
   enabled: true
-  frequency: 1          # ← 新增：每多少轮注入一次（1=每轮都注入）
+  frequency: 1
   k_window: 8
   ema_decay: 0.8
   stagnation_k: 6
   epsilon: 0.01
+  source: "evaluator"
   weights:
     score: 1.0
     params: 0.3
     latency_ms: 0.3
     flops: 0.2
     mem_mb: 0.2
-# —— 日志/落盘（可选，但强烈建议）——
-logging:
-  save_prompts_text: true         # 将每轮 user prompt 存成 txt，方便你核对
-  prompts_dir: openevolve_output/prompts
 
-# —— 其它与 sampler 行为相关的开关（若想看 evaluator 输出）——
-include_artifacts: true           # 已被 sampler 使用，控制是否拼 artifacts
-use_template_stochasticity: false # 关闭模板随机扰动，便于复现实验
 
