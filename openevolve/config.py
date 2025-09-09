@@ -12,69 +12,43 @@ import yaml
 
 @dataclass
 class LLMModelConfig:
-    """Configuration for a single LLM model"""
-
-    # API configuration
     api_base: str = None
     api_key: Optional[str] = None
     name: str = None
-
-    # Weight for model in ensemble
     weight: float = 1.0
-
-    # Generation parameters
     system_message: Optional[str] = None
     temperature: float = None
     top_p: float = None
     max_tokens: int = None
-
-    # Request parameters
     timeout: int = None
     retries: int = None
     retry_delay: int = None
-
-    # Reproducibility
     random_seed: Optional[int] = None
 
 
 @dataclass
 class LLMConfig(LLMModelConfig):
-    """Configuration for LLM models"""
-
-    # API configuration
     api_base: str = "https://api.openai.com/v1"
-
-    # Generation parameters
     system_message: Optional[str] = "system_message"
     temperature: float = 0.7
     top_p: float = 0.95
     max_tokens: int = 4096
-
-    # Request parameters
     timeout: int = 60
     retries: int = 3
     retry_delay: int = 5
 
-    # n-model configuration for evolution LLM ensemble
-    models: List[LLMModelConfig] = field(
-        default_factory=lambda: [
-            LLMModelConfig(name="gpt-4o-mini", weight=0.8),
-            LLMModelConfig(name="gpt-4o", weight=0.2),
-        ]
-    )
-
-    # n-model configuration for evaluator LLM ensemble
+    models: List[LLMModelConfig] = field(default_factory=lambda: [
+        LLMModelConfig(name="gpt-4o-mini", weight=0.8),
+        LLMModelConfig(name="gpt-4o", weight=0.2),
+    ])
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
 
-    # Backward compatibility with primary_model(_weight) options
     primary_model: str = None
     primary_model_weight: float = None
     secondary_model: str = None
     secondary_model_weight: float = None
 
     def __post_init__(self):
-        """Post-initialization to set up model configurations"""
-        # Handle backward compatibility for primary_model(_weight) and secondary_model(_weight).
         if (self.primary_model or self.primary_model_weight) and len(self.models) < 1:
             self.models.append(LLMModelConfig())
         if self.primary_model:
@@ -89,11 +63,9 @@ class LLMConfig(LLMModelConfig):
         if self.secondary_model_weight:
             self.models[1].weight = self.secondary_model_weight
 
-        # If no evaluator models are defined, use the same models as for evolution
         if not self.evaluator_models or len(self.evaluator_models) < 1:
             self.evaluator_models = self.models.copy()
 
-        # Update models with shared configuration values
         shared_config = {
             "api_base": self.api_base,
             "api_key": self.api_key,
@@ -108,38 +80,35 @@ class LLMConfig(LLMModelConfig):
         self.update_model_params(shared_config)
 
     def update_model_params(self, args: Dict[str, Any], overwrite: bool = False) -> None:
-        """Update model parameters for all models"""
         for model in self.models + self.evaluator_models:
             for key, value in args.items():
                 if overwrite or getattr(model, key, None) is None:
                     setattr(model, key, value)
 
 
-# —— DirectionFeedback 的“权重”子配置 ——
+# ---- Direction Feedback ----
 @dataclass
 class DirectionFeedbackWeights:
     score: float = 1.0
     params: float = 0.3
     latency_ms: float = 0.3
-    flops: float = 0.2       # 你可以把 FLOPs 理解为 MACs
+    flops: float = 0.2
     mem_mb: float = 0.2
 
 
-# —— DirectionFeedback 主配置（与 PromptConfig 同级） ——
 @dataclass
 class DirectionFeedbackConfig:
-    enabled: bool = False           # 是否开启方向注入
-    frequency: int = 1              # 每 N 轮注入一次（1=每轮）
-    k_window: int = 8               # 方向估计的滑窗
-    ema_decay: float = 0.8          # EMA 衰减系数
-    stagnation_k: int = 6           # 平台期判定窗口
-    epsilon: float = 0.01           # 最小改进阈值
-    source: Optional[str] = None    # 可选：指导来源标记（evaluator/db/llm等）
+    enabled: bool = False
+    frequency: int = 1
+    k_window: int = 8
+    ema_decay: float = 0.8
+    stagnation_k: int = 6
+    epsilon: float = 0.01
+    source: Optional[str] = None
     weights: DirectionFeedbackWeights = field(default_factory=DirectionFeedbackWeights)
 
-    # === 新增：用于立即落地 ===
-    warmup_k: int = 3                              # 前 K 轮只收集数据，不更新方向
-    max_df_lines: int = 12                         # DF 文本的行数上限，防止挤爆 prompt
+    warmup_k: int = 3
+    max_df_lines: int = 12
     allowed_ops: List[str] = field(default_factory=lambda: [
         "tile_size ∈ {16,32}", "unroll ∈ {2,4,8}",
         "bias_outside_inner_loop", "accumulator_in_register",
@@ -153,75 +122,45 @@ class DirectionFeedbackConfig:
 
 @dataclass
 class PromptConfig:
-    """Configuration for prompt generation"""
     save_prompts_text: Optional[bool] = False
     prompts_dir: Optional[str] = None
     template_dir: Optional[str] = None
     system_message: str = "system_message"
     evaluator_system_message: str = "evaluator_system_message"
-
-    # Number of examples to include in the prompt
     num_top_programs: int = 3
     num_diverse_programs: int = 2
-
-    # Template stochasticity
     use_template_stochasticity: bool = True
     template_variations: Dict[str, List[str]] = field(default_factory=dict)
-
-    # Meta-prompting
     use_meta_prompting: bool = False
     meta_prompt_weight: float = 0.1
-
-    # Artifact rendering
     include_artifacts: bool = True
-    max_artifact_bytes: int = 20 * 1024  # 20KB in prompt
+    max_artifact_bytes: int = 20 * 1024
     artifact_security_filter: bool = True
-
-    # Feature extraction and program labeling
     suggest_simplification_after_chars: Optional[int] = 500
     include_changes_under_chars: Optional[int] = 100
     concise_implementation_max_lines: Optional[int] = 10
     comprehensive_implementation_min_lines: Optional[int] = 50
-
-    # Backward compatibility - deprecated
     code_length_threshold: Optional[int] = None
 
 
 @dataclass
 class DatabaseConfig:
-    """Configuration for the program database"""
-
-    # General settings
-    db_path: Optional[str] = None  # Path to store database on disk
+    db_path: Optional[str] = None
     in_memory: bool = True
-
-    # Prompt and response logging to programs/<id>.json
     log_prompts: bool = True
-
-    # Evolutionary parameters
     population_size: int = 1000
     archive_size: int = 100
     num_islands: int = 5
-
-    # Selection parameters
     elite_selection_ratio: float = 0.1
     exploration_ratio: float = 0.2
     exploitation_ratio: float = 0.7
-    diversity_metric: str = "edit_distance"  # Options: "edit_distance", "feature_based"
-
-    # Feature map dimensions for MAP-Elites
+    diversity_metric: str = "edit_distance"
     feature_dimensions: List[str] = field(default_factory=lambda: ["complexity", "diversity"])
     feature_bins: Union[int, Dict[str, int]] = 10
     diversity_reference_size: int = 20
-
-    # Migration parameters for island-based evolution
     migration_interval: int = 50
     migration_rate: float = 0.1
-
-    # Random seed for reproducible sampling
     random_seed: Optional[int] = 42
-
-    # Artifact storage
     artifacts_base_path: Optional[str] = None
     artifact_size_threshold: int = 32 * 1024
     cleanup_old_artifacts: bool = True
@@ -230,38 +169,30 @@ class DatabaseConfig:
 
 @dataclass
 class EvaluatorConfig:
-    """Configuration for program evaluation"""
-
-    # General settings
     timeout: int = 300
     max_retries: int = 3
-
-    # Resource limits for evaluation
     memory_limit_mb: Optional[int] = None
     cpu_limit: Optional[float] = None
-
-    # Evaluation strategies
     cascade_evaluation: bool = True
     cascade_thresholds: List[float] = field(default_factory=lambda: [0.5, 0.75, 0.9])
-
-    # Parallel evaluation
     parallel_evaluations: int = 1
     distributed: bool = False
-
-    # LLM-based feedback
     use_llm_feedback: bool = False
     llm_feedback_weight: float = 0.1
-
-    # Artifact handling
     enable_artifacts: bool = True
     max_artifact_storage: int = 100 * 1024 * 1024
+
+    # ---- 新增：评测预算参数（可用来快速降低 timeout 概率）----
+    max_steps: Optional[int] = None            # e.g. 20
+    max_train_batches: Optional[int] = None    # e.g. 20
+    max_eval_batches: Optional[int] = None     # e.g. 20
+    train_subset: Optional[int] = None         # e.g. 2000 samples
+    eval_subset: Optional[int] = None          # e.g. 2000 samples
+    batch_size: Optional[int] = None           # override evaluator default
 
 
 @dataclass
 class Config:
-    """Master configuration for OpenEvolve"""
-
-    # General settings
     max_iterations: int = 10000
     checkpoint_interval: int = 100
     log_level: str = "INFO"
@@ -269,37 +200,29 @@ class Config:
     random_seed: Optional[int] = 42
     language: str = None
 
-    # Component configurations
     llm: LLMConfig = field(default_factory=LLMConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
-
     direction_feedback: DirectionFeedbackConfig = field(default_factory=DirectionFeedbackConfig)
 
-    # Evolution settings
     diff_based_evolution: bool = True
     max_code_length: int = 10000
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "Config":
-        """Load configuration from a YAML file"""
         with open(path, "r") as f:
             config_dict = yaml.safe_load(f)
         return cls.from_dict(config_dict)
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
-        """Create configuration from a dictionary"""
         config = Config()
-
-        # Update top-level fields
         for key, value in config_dict.items():
             if key not in ["llm", "prompt", "database", "evaluator",
                            "direction_feedback", "directional_feedback"] and hasattr(config, key):
                 setattr(config, key, value)
 
-        # Nested configs
         if "llm" in config_dict:
             llm_dict = config_dict["llm"]
             if "models" in llm_dict:
@@ -314,37 +237,32 @@ class Config:
         if "database" in config_dict:
             config.database = DatabaseConfig(**config_dict["database"])
 
-        # —— Direction Feedback（支持两个别名 + 过滤未知键）——
+        # Direction Feedback（别名+过滤）
         df_key = "direction_feedback" if "direction_feedback" in config_dict else \
                  ("directional_feedback" if "directional_feedback" in config_dict else None)
         if df_key:
             df_dict = dict(config_dict[df_key] or {})
-            # 过滤未知键，避免把 logging 等塞进来
             allowed = set(DirectionFeedbackConfig.__dataclass_fields__.keys())
             df_dict = {k: v for k, v in df_dict.items() if k in allowed}
-            # 处理 weights 子字典
             if "weights" in df_dict and isinstance(df_dict["weights"], dict):
                 df_dict["weights"] = DirectionFeedbackWeights(**df_dict["weights"])
             config.direction_feedback = DirectionFeedbackConfig(**df_dict)
 
-        if config.database.random_seed is None and config.random_seed is not None:
-            config.database.random_seed = config.random_seed
-
         if "evaluator" in config_dict:
             config.evaluator = EvaluatorConfig(**config_dict["evaluator"])
+
+        if config.database.random_seed is None and config.random_seed is not None:
+            config.database.random_seed = config.random_seed
 
         return config
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert configuration to a dictionary"""
         return {
-            # General settings
             "max_iterations": self.max_iterations,
             "checkpoint_interval": self.checkpoint_interval,
             "log_level": self.log_level,
             "log_dir": self.log_dir,
             "random_seed": self.random_seed,
-            # Component configurations
             "llm": {
                 "models": self.llm.models,
                 "evaluator_models": self.llm.evaluator_models,
@@ -389,12 +307,17 @@ class Config:
                 "parallel_evaluations": self.evaluator.parallel_evaluations,
                 "use_llm_feedback": self.evaluator.use_llm_feedback,
                 "llm_feedback_weight": self.evaluator.llm_feedback_weight,
+                "enable_artifacts": self.evaluator.enable_artifacts,
+                "max_artifact_storage": self.evaluator.max_artifact_storage,
+                "max_steps": self.evaluator.max_steps,
+                "max_train_batches": self.evaluator.max_train_batches,
+                "max_eval_batches": self.evaluator.max_eval_batches,
+                "train_subset": self.evaluator.train_subset,
+                "eval_subset": self.evaluator.eval_subset,
+                "batch_size": self.evaluator.batch_size,
             },
-            # Evolution settings
             "diff_based_evolution": self.diff_based_evolution,
             "max_code_length": self.max_code_length,
-
-            # Direction Feedback（完整导出）
             "direction_feedback": {
                 "enabled": self.direction_feedback.enabled,
                 "frequency": self.direction_feedback.frequency,
@@ -418,13 +341,11 @@ class Config:
         }
 
     def to_yaml(self, path: Union[str, Path]) -> None:
-        """Save configuration to a YAML file"""
         with open(path, "w") as f:
             yaml.dump(self.to_dict(), f, default_flow_style=False)
 
 
 def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
-    """Load configuration from a YAML file or use defaults"""
     if config_path and os.path.exists(config_path):
         config = Config.from_yaml(config_path)
     else:
@@ -432,7 +353,5 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
         api_key = os.environ.get("OPENAI_API_KEY")
         api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
         config.llm.update_model_params({"api_key": api_key, "api_base": api_base})
-
-    # Make the system message available to the individual models
     config.llm.update_model_params({"system_message": config.prompt.system_message})
     return config

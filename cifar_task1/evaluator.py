@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 import os
-# ---- 线程与后端：避免 fork + autograd 冲突（强制单线程 & CPU）----
+# # ---- 线程与后端：避免 fork + autograd 冲突（强制单线程 & CPU）----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
@@ -143,7 +143,7 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
     model, meta = program_module.build_model()
     model.to(device)
 
-    train_loader, test_loader = _get_cifar10_dataloaders(train_n=100, test_n=100, seed=42, bs=50)
+    train_loader, test_loader = _get_cifar10_dataloaders(train_n=100, test_n=20, seed=42, bs=50)
 
     # 训练（小预算）；遇到 fork+autograd 冲突时自动跳过训练
     do_train = os.environ.get("OE_SKIP_TRAIN", "0") != "1"
@@ -153,7 +153,7 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
             model.train()
             optim = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.0)
             criterion = nn.CrossEntropyLoss()
-            max_steps = 100
+            max_steps = 20
             steps = 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
