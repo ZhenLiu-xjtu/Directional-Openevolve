@@ -34,7 +34,7 @@ llm:
 prompt:
   # 新增：建议把这两项放在 prompt 下
   save_prompts_text: true
-  prompts_dir: "openevolve_output/prompts"
+  prompts_dir: "openevolve_output/prompts_twostep"
 
   template_dir: null                  # Custom directory for prompt templates
   system_message: "You are an expert coder helping to improve programs through evolution."
@@ -163,9 +163,13 @@ direction_feedback:
     - "torch.mm / torch.mv / torch.matmul / @ / einsum / bmm"
     - "innermost loop over B (batch dimension)"
     - "write through a view (e.g., out_b = out[b]; out_b[j] = ...)"
-  weights:
-    score: 1.0
-    latency_ms: 0.35
-    flops: 0.40
-    params: 0.15
-    mem_mb: 0.10
+  # --- 新增项（可选） ---
+  metric_keys: ["acc", "latency_ms", "params"]
+  weights: { perf: 1.0, latency: 0.5, params: 0.3 }
+  resource_tolerances: { params_pct: 0.10, flops_pct: 0.20, mem_pct: 0.15 }
+  stagnation: { k: 5, slope_eps: 1.0e-3 }
+  diversify_penalty_cos: 0.92
+  actions:
+    prefer_ops: ["addmv"]         # 等价于你原来的 allowed_ops
+    avoid_ops: ["mm", "dot"]      # 等价于你原来的 forbidden_patterns
+    max_param_increase_pct: 0.05

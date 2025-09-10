@@ -67,6 +67,10 @@ class PromptSampler:
         # print("direction_guidance:",direction_guidance)
         # print("self.config:",self.config)
         # print(",self.direction_cfg:",self.direction_cfg)
+        self._ctx_prev = previous_programs
+        self._ctx_top  = top_programs
+
+
         direction_block = self._build_direction_block(
             evolution_round=evolution_round,
             previous_programs=previous_programs,
@@ -225,8 +229,6 @@ class PromptSampler:
         program_metrics: Optional[Dict[str, Any]],
     ) -> str:
         explicit_dir = (direction_guidance or "").strip()
-        # print("explicit_dir:",explicit_dir)
-        # print("direction_guidance1:",direction_guidance)
         if not parent_program_dict and previous_programs:
             parent_program_dict = previous_programs[-1]
 
@@ -283,6 +285,35 @@ class PromptSampler:
         return text
 
     def _format_direction_feedback(self, program: Dict[str, Any]) -> str:
+        """
+        Anchor-aware Directional Feedback:
+        1) 选锚点：同资源 > 异源 > 幻想
+        2) 计算方向向量与步长
+        3) 生成可操作的自然语言 DF
+        4) 任何缺失 → 回退到旧的 slope/stagnation 提示
+        """
+        try:
+            cfg = self._aa_cfg()
+            # 这些上下文来自 build_prompt() 的入参；此处在 build_prompt() 里保存一下即可
+            prev = getattr(self, "_ctx_prev", []) or []
+            top = getattr(self, "_ctx_top", []) or []
+            hist = prev  # 简化：以 previous_programs 近 k 轮作为岛内历史
+
+            cur = program or {}
+            anchor = self._select_anchor(cur, hist, prev, top, cfg)
+            if anchor:
+                dv, step, targets = self._direction_and_step(cur, anchor, cfg["weights"], hist, cfg["stagnation"]["k"])
+                text = self._render_anchor_text(
+                    cur, anchor, dv, step,
+                    actions=cfg.get("actions", {}),
+                    max_params_pct=cfg.get("actions", {}).get("max_param_increase_pct", 0.05),
+                )
+                return text
+
+        except Exception as _e:
+            logger.debug("anchor-aware DF failed, fallback to legacy: %s", _e)
+
+        # ---------- 安全回退：使用你现有的“坡度/平台期”提示 ----------
         md = (program or {}).get("metadata", {}) or {}
         slope = md.get("slope_on_baseline", None)
         slope_avg = md.get("slope_mean_k", None)
@@ -294,11 +325,15 @@ class PromptSampler:
         if warmup:  lines.append("- WARMUP: collecting statistics; real direction will start after warmup_k")
         if invalid: lines.append("- INVALID: this round not used for direction update")
         if slope is not None:
-            try: lines.append(f"- slope_on_island_baseline: {float(slope):.3f}")
-            except Exception: lines.append(f"- slope_on_island_baseline: {slope}")
+            try:
+                lines.append(f"- slope_on_island_baseline: {float(slope):.3f}")
+            except Exception:
+                lines.append(f"- slope_on_island_baseline: {slope}")
         if slope_avg is not None:
-            try: lines.append(f"- slope_mean_k: {float(slope_avg):.3f}")
-            except Exception: lines.append(f"- slope_mean_k: {slope_avg}")
+            try:
+                lines.append(f"- slope_mean_k: {float(slope_avg):.3f}")
+            except Exception:
+                lines.append(f"- slope_mean_k: {slope_avg}")
         if stagnating is not None:
             lines.append(f"- stagnating: {bool(stagnating)}")
 
@@ -320,3 +355,195 @@ class PromptSampler:
         except Exception as _e:
             logger.debug("Template variation skipped: %s", _e)
         return template
+
+
+    # ======= Anchor-aware DF: helpers (NEW) =======
+
+    def _aa_cfg(self) -> dict:
+        """Anchor-aware 配置的默认值 + 兼容 direction_cfg 里的老键"""
+        cfg_dir = {}
+        if self.direction_cfg is not None:
+            if isinstance(self.direction_cfg, dict):
+                cfg_dir = self.direction_cfg
+            else:
+                try:
+                    from dataclasses import asdict as _asdict
+                    cfg_dir = _asdict(self.direction_cfg)
+                except Exception:
+                    cfg_dir = getattr(self.direction_cfg, "__dict__", {}) or {}
+
+        # 兼容老键：allowed_ops/forbidden_patterns
+        actions = cfg_dir.get("actions", {})
+        if not actions and (("allowed_ops" in cfg_dir) or ("forbidden_patterns" in cfg_dir)):
+            actions = {
+                "prefer_ops": cfg_dir.get("allowed_ops", []),
+                "avoid_ops": cfg_dir.get("forbidden_patterns", []),
+                "max_param_increase_pct": cfg_dir.get("max_param_increase_pct", 0.05),
+            }
+
+        return {
+            "metric_keys": cfg_dir.get("metric_keys", ["acc", "latency_ms", "params"]),
+            "weights": cfg_dir.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3}),
+            "resource_tolerances": cfg_dir.get("resource_tolerances", {"params_pct": 0.10, "flops_pct": 0.20, "mem_pct": 0.15}),
+            "stagnation": cfg_dir.get("stagnation", {"k": 5, "slope_eps": 1e-3}),
+            "diversify_penalty_cos": cfg_dir.get("diversify_penalty_cos", 0.92),
+            "actions": actions,
+        }
+
+    def _m(self, prog: dict, key: str, default=0.0):
+        """安全获取 metrics 的键；支持常见别名"""
+        m = (prog or {}).get("metrics", {}) or {}
+        alias = {
+            "acc": ["acc", "accuracy", "top1", "top1_acc"],
+            "latency_ms": ["latency_ms", "infer_time_ms", "infer_time_s", "latency_s"],
+            "flops": ["macs", "flops"],
+            "combined_score": ["combined_score"],
+            "params": ["params", "num_params"],
+        }
+        keys = alias.get(key, [key])
+        for k in keys:
+            v = m.get(k, None)
+            if v is None and k.endswith("_s"):
+                # 秒 -> 毫秒
+                try:
+                    v = float(m.get(k, 0.0)) * 1000.0
+                except Exception:
+                    pass
+            if v is not None:
+                try: return float(v)
+                except Exception: return v
+        # 资源类也可能放在 resources 里
+        if key in ("params", "flops", "mem_mb"):
+            r = (prog or {}).get("resources", {}) or {}
+            v = r.get(key, None)
+            if v is not None:
+                try: return float(v)
+                except Exception: return v
+        return default
+
+    def _r(self, prog: dict, key: str, default=0.0):
+        """安全获取 resources 的键"""
+        r = (prog or {}).get("resources", {}) or {}
+        v = r.get(key, None)
+        if v is None and key in ("flops", "macs"):
+            v = (prog or {}).get("metrics", {}).get("macs", None)
+        return float(v) if isinstance(v, (int, float)) else (v if v is not None else default)
+
+    def _resource_close(self, a: dict, b: dict, tol: dict) -> bool:
+        def ok(key, pct):
+            av = self._r(a, key, None); bv = self._r(b, key, None)
+            if av is None or bv is None: return False
+            denom = max(1e-9, float(av))
+            return abs(float(av) - float(bv)) / denom <= pct
+        return (
+            ok("params", tol.get("params_pct", 0.10)) and
+            (ok("flops",  tol.get("flops_pct",  0.20)) or ok("macs", tol.get("flops_pct", 0.20))) and
+            ok("mem_mb",  tol.get("mem_pct",    0.15))
+        )
+
+    def _pick_same_resource_anchor(self, cur: dict, candidates: list, tol: dict):
+        best = None; best_gain = 0.0
+        cur_acc = self._m(cur, "acc", 0.0)
+        for p in candidates:
+            if p is cur:
+                continue
+            if not self._resource_close(cur, p, tol):
+                continue
+            gain = self._m(p, "acc", 0.0) - cur_acc
+            if gain > best_gain:
+                best_gain = gain; best = p
+        return best
+
+    def _pick_hetero_anchor(self, cur: dict, candidates: list):
+        # 简化版“思路差异”：以 (params, flops, latency) 差异 + acc 提升的线性组合
+        cur_vec = [self._m(cur, "acc", 0.0), self._m(cur, "latency_ms", 0.0), self._m(cur, "params", 0.0)]
+        best = None; best_score = -1e18
+        for p in candidates:
+            if p is cur:
+                continue
+            pv = [self._m(p, "acc", 0.0), self._m(p, "latency_ms", 0.0), self._m(p, "params", 0.0)]
+            diff = abs(pv[2] - cur_vec[2]) + abs(pv[1] - cur_vec[1])  # 资源&延迟差异
+            score = (pv[0] - cur_vec[0]) + 0.3 * diff                 # acc 提升 + 差异性
+            if score > best_score:
+                best_score = score; best = p
+        return best
+
+    def _hallucinated_anchor(self, cur: dict, history: list, k: int, max_param_inc_pct: float):
+        if not history or len(history) < 2:
+            return None
+        tail = history[-min(k, len(history)):]
+        d_acc = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
+        d_param = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
+        d_lat = self._m(tail[-1], "latency_ms", 0.0) - self._m(tail[0], "latency_ms", 0.0)
+
+        def sdiv(a, b): return float(a) / (abs(float(b)) + 1e-9)
+        acc_target = self._m(cur, "acc", 0.0) + 0.8 * (sdiv(d_acc, d_param) + sdiv(d_acc, d_lat))
+        params_target = self._m(cur, "params", 0.0) * (1.0 + float(max_param_inc_pct))
+
+        # 构造“虚拟锚点”
+        return {
+            "id": "virtual_anchor",
+            "metrics": {
+                "acc": acc_target,
+                "latency_ms": max(0.0, self._m(cur, "latency_ms", 0.0) - 0.1 * abs(d_lat)),
+                "combined_score": self._m(cur, "combined_score", 0.0)
+            },
+            "resources": {
+                "params": params_target,
+                "flops": self._m(cur, "flops", 0.0),
+                "mem_mb": self._r(cur, "mem_mb", 0.0),
+            },
+        }
+
+    def _direction_and_step(self, cur: dict, anc: dict, weights: dict, history: list, k: int):
+        cur_acc = self._m(cur, "acc", 0.0); tar_acc = self._m(anc, "acc", cur_acc)
+        cur_lat = self._m(cur, "latency_ms", 0.0); tar_lat = self._m(anc, "latency_ms", cur_lat)
+        cur_par = self._m(cur, "params", 0.0); tar_par = self._m(anc, "params", cur_par)
+
+        dv = [
+            float(weights.get("perf", 1.0))    * (tar_acc - cur_acc),
+            -float(weights.get("latency", 0.5)) * (tar_lat - cur_lat),
+            -float(weights.get("params", 0.3))  * (tar_par - cur_par),
+        ]
+
+        step = 0.3
+        if history and len(history) >= 2:
+            tail = history[-min(k, len(history)):]
+            gain = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
+            d_params = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
+            step = float(max(0.1, min(1.0, (gain / (abs(d_params) + 1e-9)))))
+
+        return dv, step, {"acc_target": tar_acc, "latency_target": tar_lat, "params_target": tar_par}
+
+    def _render_anchor_text(self, cur: dict, anchor: dict, dv: list, step: float, actions: dict, max_params_pct: float):
+        cur_acc = self._m(cur, "acc", 0.0)
+        tar_acc = self._m(anchor, "acc", cur_acc)
+        cur_par = self._m(cur, "params", 0.0)
+        budget = cur_par * (1.0 + float(max_params_pct))
+
+        prefer_ops = ", ".join(actions.get("prefer_ops", [])) if actions else ""
+        avoid_ops  = ", ".join(actions.get("avoid_ops", [])) if actions else ""
+
+        latency_proj = max(0.0, self._m(cur, "latency_ms", 0.0) - abs(float(dv[1])))
+
+        lines = [
+            "## Directional Guidance",
+            f"[Anchor-aware] Raise acc {cur_acc:.4f} → ≥ {tar_acc:.4f}; keep params ≤ {budget:.0f}.",
+            f"Projected latency target: ≤ {latency_proj:.1f} ms.",
+        ]
+        if prefer_ops:
+            lines.append("**Preferred ops/knobs:** " + prefer_ops)
+        if avoid_ops:
+            lines.append("**Avoid patterns:** " + avoid_ops)
+        lines.append(f"**Normalized step size:** {step:.2f}")
+        return "\n".join(lines)
+
+    def _select_anchor(self, cur: dict, history: list, prev: list, top: list, cfg: dict):
+        candidates = (top or []) + (prev or [])
+        same = self._pick_same_resource_anchor(cur, candidates, cfg["resource_tolerances"])
+        if same:
+            return same
+        hetero = self._pick_hetero_anchor(cur, candidates)
+        if hetero:
+            return hetero
+        return self._hallucinated_anchor(cur, history, cfg["stagnation"]["k"], cfg["actions"].get("max_param_increase_pct", 0.05))
