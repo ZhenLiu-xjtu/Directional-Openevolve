@@ -216,6 +216,7 @@ class Config:
     def from_yaml(cls, path: Union[str, Path]) -> "Config":
         with open(path, "r") as f:
             config_dict = yaml.safe_load(f)
+        # print("config_dict11:",config_dict)
         return cls.from_dict(config_dict)
 
     @classmethod
@@ -239,14 +240,19 @@ class Config:
 
         if "database" in config_dict:
             config.database = DatabaseConfig(**config_dict["database"])
-
+        if "direction_feedback" in config_dict:
+            config.direction_feedback = DirectionFeedbackConfig(**config_dict["direction_feedback"])
+        # print("config_dict:",config_dict)
+        # print("direction_feedback111:", config.direction_feedback)
         # Direction Feedback（别名+过滤）
         df_key = "direction_feedback" if "direction_feedback" in config_dict else \
                  ("directional_feedback" if "directional_feedback" in config_dict else None)
+        # print("df_key:",df_key)
         if df_key:
             df_dict = dict(config_dict[df_key] or {})
             allowed = set(DirectionFeedbackConfig.__dataclass_fields__.keys())
             df_dict = {k: v for k, v in df_dict.items() if k in allowed}
+            # print("df_dict:",df_dict)
             if "weights" in df_dict and isinstance(df_dict["weights"], dict):
                 df_dict["weights"] = DirectionFeedbackWeights(**df_dict["weights"])
             config.direction_feedback = DirectionFeedbackConfig(**df_dict)

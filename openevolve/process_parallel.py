@@ -67,7 +67,7 @@ from openevolve.database import Program, ProgramDatabase
 from openevolve.utils.metrics_utils import safe_numeric_average
 Evaluator = _eval_mod.Evaluator
 PromptSampler = _sampler_mod.PromptSampler
-
+dc_asdict = asdict
 # safe_numeric_average 兜底
 if _utils_metrics and hasattr(_utils_metrics, "safe_numeric_average"):
     safe_numeric_average = _utils_metrics.safe_numeric_average
@@ -107,6 +107,10 @@ _worker_prompt_sampler = None
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
     """Initialize worker process with necessary components"""
     # 继承主进程环境变量（例如 API Key、调试开关等）
+    from openevolve.config import (
+        Config, DatabaseConfig, EvaluatorConfig, LLMConfig, PromptConfig, LLMModelConfig, DirectionFeedbackConfig
+    )
+
     if parent_env:
         os.environ.update(parent_env)
 
@@ -120,23 +124,32 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     llm_dict["models"] = models
     llm_dict["evaluator_models"] = evaluator_models
     llm_config = LLMConfig(**llm_dict)
-
+    # print("config_dict127:",config_dict)
     prompt_config = PromptConfig(**config_dict["prompt"])
     database_config = DatabaseConfig(**config_dict["database"])
     evaluator_config = EvaluatorConfig(**config_dict["evaluator"])
+    # print("config_dict:",config_dict)
+    raw_df = config_dict.get("direction_feedback", None)
+    # print("raw_df:",raw_df)
+    # direction_config = EvaluatorConfig(**config_dict["direction_feedback"])
+    # print("direction_config:",direction_config)
+    # if isinstance(raw_df, dict):
+    #     df_obj = DirectionFeedbackConfig(**raw_df)
+    # elif isinstance(raw_df, DirectionFeedbackConfig):
+    #     df_obj = raw_df
+    # else:
+    #     df_obj = DirectionFeedbackConfig()
+    #
+    # _worker_direction_cfg = dc_asdict(df_obj)
 
     other_keys = {k: v for k, v in config_dict.items() if k not in ["llm", "prompt", "database", "evaluator"]}
-
+    # print("other_keys:",other_keys)
     _worker_config = Config(
         llm=llm_config,
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
-        **{
-            k: v
-            for k, v in config_dict.items()
-            if k not in ["llm", "prompt", "database", "evaluator"]
-        },
+        **other_keys,
     )
     _worker_evaluation_file = evaluation_file
 
@@ -144,6 +157,8 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     _worker_llm_ensemble = None
     _worker_prompt_sampler = None
 
+
+    _worker_dir_tracker = None
 
 def _lazy_init_worker_components():
     """Lazily initialize expensive components on first use"""
@@ -156,8 +171,8 @@ def _lazy_init_worker_components():
 
     if _worker_prompt_sampler is None:
         from openevolve.prompt.sampler import PromptSampler
-
-        _worker_prompt_sampler = PromptSampler(_worker_config.prompt)
+        # print("_worker_config.direction_feedback:",_worker_config.direction_feedback)
+        _worker_prompt_sampler = PromptSampler(_worker_config.prompt, _worker_config.direction_feedback)
 
     if _worker_evaluator is None:
         from openevolve.evaluator import Evaluator
@@ -351,6 +366,7 @@ class ProcessParallelController:
             "early_stopping_patience": getattr(config, "early_stopping_patience", None),
             "convergence_threshold": getattr(config, "convergence_threshold", 0.0),
             "early_stopping_metric": getattr(config, "early_stopping_metric", "combined_score"),
+            "direction_feedback": asdict(config.direction_feedback),
         }
 
     def start(self) -> None:

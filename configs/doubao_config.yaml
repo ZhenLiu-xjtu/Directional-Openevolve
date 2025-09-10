@@ -143,7 +143,7 @@ evaluator:
 
 
 direction_feedback:
-  enabled: true
+  enabled: True
   frequency: 1
   warmup_k: 3
   k_window: 8

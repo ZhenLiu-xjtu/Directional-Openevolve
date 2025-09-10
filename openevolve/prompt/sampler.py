@@ -64,7 +64,9 @@ class PromptSampler:
         improvement_areas = self._render_improvement_areas(program_metrics, previous_programs)
         direction_guidance = direction_guidance or "Tend towards lower FLOPs; Attempt to tile/unroll and constrain the number of parameters"
 
-        print("direction_guidance:",direction_guidance)
+        # print("direction_guidance:",direction_guidance)
+        # print("self.config:",self.config)
+        # print(",self.direction_cfg:",self.direction_cfg)
         direction_block = self._build_direction_block(
             evolution_round=evolution_round,
             previous_programs=previous_programs,
@@ -72,7 +74,7 @@ class PromptSampler:
             direction_guidance=direction_guidance,
             program_metrics=program_metrics,
         )
-        print("direction_block:",direction_block)
+        # print("direction_block:",direction_block)
         user_message = user_template.format(
             metrics=metrics_str,
             improvement_areas=improvement_areas,
@@ -223,6 +225,8 @@ class PromptSampler:
         program_metrics: Optional[Dict[str, Any]],
     ) -> str:
         explicit_dir = (direction_guidance or "").strip()
+        # print("explicit_dir:",explicit_dir)
+        # print("direction_guidance1:",direction_guidance)
         if not parent_program_dict and previous_programs:
             parent_program_dict = previous_programs[-1]
 
@@ -238,6 +242,7 @@ class PromptSampler:
         merged_dir = explicit_dir if explicit_dir else auto_dir
 
         cfg_dir: Dict[str, Any] = {}
+        # print("self.direction_cfg:",self.direction_cfg)
         if self.direction_cfg is not None:
             if isinstance(self.direction_cfg, dict):
                 cfg_dir = self.direction_cfg
@@ -246,7 +251,7 @@ class PromptSampler:
                     cfg_dir = dc_asdict(self.direction_cfg)
                 except Exception:
                     cfg_dir = getattr(self.direction_cfg, "__dict__", {}) or {}
-
+        # print("cfg_dir:",cfg_dir)
         enabled = bool(cfg_dir.get("enabled", False))
         freq = int(cfg_dir.get("frequency", 1) or 1)
         max_lines = int(cfg_dir.get("max_df_lines", 12))
@@ -255,6 +260,8 @@ class PromptSampler:
                     enabled, freq, len(explicit_dir), len(auto_dir), __file__)
 
         should_inject = bool(enabled and (int(evolution_round) % freq == 0))
+        # print("enabled:",enabled,evolution_round,freq,should_inject)
+        #  False 1 1 False
         if not should_inject:
             return ""
 
