@@ -6,7 +6,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-
+# ==== imports ====
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict
 import yaml
 
 
@@ -97,18 +99,74 @@ class DirectionFeedbackWeights:
 
 
 @dataclass
+# class DirectionFeedbackConfig:
+#     enabled: bool = False
+#     frequency: int = 1
+#     k_window: int = 8
+#     ema_decay: float = 0.8
+#     stagnation_k: int = 6
+#     epsilon: float = 0.01
+#     source: Optional[str] = None
+#     weights: DirectionFeedbackWeights = field(default_factory=DirectionFeedbackWeights)
+#
+#     warmup_k: int = 3
+#     max_df_lines: int = 12
+#     allowed_ops: List[str] = field(default_factory=lambda: [
+#         "tile_size ∈ {16,32}", "unroll ∈ {2,4,8}",
+#         "bias_outside_inner_loop", "accumulator_in_register",
+#         "addcmul_ (if allowed)", "vmap (if allowed)"
+#     ])
+#     forbidden_patterns: List[str] = field(default_factory=lambda: [
+#         "innermost loop over batch dimension",
+#         "python triple-for over non-contiguous memory"
+#     ])
+
+
+
+# ---- 如果你已有 DirectionFeedbackWeights，就复用；没有的话启用下面这个默认定义 ----
+@dataclass
+class DirectionFeedbackWeights:
+    perf: float = 1.0
+    latency: float = 0.5
+    params: float = 0.3
+
+# ---- 新增：资源容差 / 平台期检测 / 动作建议 ----
+@dataclass
+class DirectionFeedbackResourceTolerances:
+    params_pct: float = 0.10
+    flops_pct: float = 0.20
+    mem_pct: float = 0.15
+
+@dataclass
+class DirectionFeedbackStagnation:
+    k: int = 5
+    slope_eps: float = 1.0e-3
+
+@dataclass
+class DirectionFeedbackActions:
+    # 等价于你原来的 allowed_ops / forbidden_patterns（见 __post_init__ 同步）
+    prefer_ops: List[str] = field(default_factory=lambda: ["addmv"])
+    avoid_ops:  List[str] = field(default_factory=lambda: ["mm", "dot"])
+    max_param_increase_pct: float = 0.05
+
+
+# ====================== 主配置 ======================
+@dataclass
 class DirectionFeedbackConfig:
+    # --- 你原有字段（保持不变） ---
     enabled: bool = False
     frequency: int = 1
     k_window: int = 8
     ema_decay: float = 0.8
-    stagnation_k: int = 6
-    epsilon: float = 0.01
+    stagnation_k: int = 6               # 兼容旧字段；会在 __post_init__ 合并到 stagnation.k
+    epsilon: float = 0.01               # 兼容旧字段；会在 __post_init__ 合并到 stagnation.slope_eps
     source: Optional[str] = None
     weights: DirectionFeedbackWeights = field(default_factory=DirectionFeedbackWeights)
 
     warmup_k: int = 3
     max_df_lines: int = 12
+
+    # 旧的动作提示（向后兼容保留）
     allowed_ops: List[str] = field(default_factory=lambda: [
         "tile_size ∈ {16,32}", "unroll ∈ {2,4,8}",
         "bias_outside_inner_loop", "accumulator_in_register",
@@ -118,6 +176,42 @@ class DirectionFeedbackConfig:
         "innermost loop over batch dimension",
         "python triple-for over non-contiguous memory"
     ])
+
+    # --- 新增字段（有默认值） ---
+    metric_keys: List[str] = field(default_factory=lambda: ["acc", "latency_ms", "params"])
+    resource_tolerances: DirectionFeedbackResourceTolerances = field(
+        default_factory=DirectionFeedbackResourceTolerances
+    )
+    stagnation: DirectionFeedbackStagnation = field(
+        default_factory=DirectionFeedbackStagnation
+    )
+    diversify_penalty_cos: float = 0.92
+    actions: DirectionFeedbackActions = field(
+        default_factory=DirectionFeedbackActions
+    )
+
+    def __post_init__(self):
+        """
+        向后兼容：
+        - 如果用户在 YAML/代码里仍设置了 allowed_ops/forbidden_patterns，但没有显式设置 actions，
+          则把它们拷贝到 actions.prefer_ops / actions.avoid_ops。
+        - 如果用户仍设置了 stagnation_k / epsilon，则合并到新字段 stagnation.k / stagnation.slope_eps。
+        """
+        # 同步动作建议
+        if (self.allowed_ops and (not self.actions or not self.actions.prefer_ops)):
+            # 覆盖默认的 ["addmv"]
+            self.actions.prefer_ops = list(self.allowed_ops)
+        if (self.forbidden_patterns and (not self.actions or not self.actions.avoid_ops)):
+            self.actions.avoid_ops = list(self.forbidden_patterns)
+
+        # 同步平台期检测参数
+        if self.stagnation_k and (self.stagnation is not None):
+            # 若用户显式在 YAML 里给了 stagnation.k，则不覆盖
+            if getattr(self.stagnation, "k", None) in (None, DirectionFeedbackStagnation().k):
+                self.stagnation.k = int(self.stagnation_k)
+        if self.epsilon and (self.stagnation is not None):
+            if getattr(self.stagnation, "slope_eps", None) in (None, DirectionFeedbackStagnation().slope_eps):
+                self.stagnation.slope_eps = float(self.epsilon)
 
 
 @dataclass
@@ -240,8 +334,6 @@ class Config:
 
         if "database" in config_dict:
             config.database = DatabaseConfig(**config_dict["database"])
-        if "direction_feedback" in config_dict:
-            config.direction_feedback = DirectionFeedbackConfig(**config_dict["direction_feedback"])
         # print("config_dict:",config_dict)
         # print("direction_feedback111:", config.direction_feedback)
         # Direction Feedback（别名+过滤）
@@ -253,9 +345,17 @@ class Config:
             allowed = set(DirectionFeedbackConfig.__dataclass_fields__.keys())
             df_dict = {k: v for k, v in df_dict.items() if k in allowed}
             # print("df_dict:",df_dict)
+            # ✅ 嵌套 dict 全部转换成 dataclass
             if "weights" in df_dict and isinstance(df_dict["weights"], dict):
                 df_dict["weights"] = DirectionFeedbackWeights(**df_dict["weights"])
-            config.direction_feedback = DirectionFeedbackConfig(**df_dict)
+            if "actions" in df_dict and isinstance(df_dict["actions"], dict):
+                df_dict["actions"] = DirectionFeedbackActions(**df_dict["actions"])
+            if "resource_tolerances" in df_dict and isinstance(df_dict["resource_tolerances"], dict):
+                df_dict["resource_tolerances"] = DirectionFeedbackResourceTolerances(**df_dict["resource_tolerances"])
+            if "stagnation" in df_dict and isinstance(df_dict["stagnation"], dict):
+                df_dict["stagnation"] = DirectionFeedbackStagnation(**df_dict["stagnation"])
+
+        config.direction_feedback = DirectionFeedbackConfig(**df_dict)
 
         if "evaluator" in config_dict:
             config.evaluator = EvaluatorConfig(**config_dict["evaluator"])
@@ -343,14 +443,31 @@ class Config:
                 "max_df_lines": self.direction_feedback.max_df_lines,
                 "allowed_ops": self.direction_feedback.allowed_ops,
                 "forbidden_patterns": self.direction_feedback.forbidden_patterns,
+                # ✅ 新权重命名
                 "weights": {
-                    "score": self.direction_feedback.weights.score,
+                    "perf": self.direction_feedback.weights.perf,
+                    "latency": self.direction_feedback.weights.latency,
                     "params": self.direction_feedback.weights.params,
-                    "latency_ms": self.direction_feedback.weights.latency_ms,
-                    "flops": self.direction_feedback.weights.flops,
-                    "mem_mb": self.direction_feedback.weights.mem_mb,
+                },
+                # ✅ 新增字段一并导出
+                "metric_keys": list(self.direction_feedback.metric_keys),
+                "resource_tolerances": {
+                    "params_pct": self.direction_feedback.resource_tolerances.params_pct,
+                    "flops_pct": self.direction_feedback.resource_tolerances.flops_pct,
+                    "mem_pct": self.direction_feedback.resource_tolerances.mem_pct,
+                },
+                "stagnation": {
+                    "k": self.direction_feedback.stagnation.k,
+                    "slope_eps": self.direction_feedback.stagnation.slope_eps,
+                },
+                "diversify_penalty_cos": self.direction_feedback.diversify_penalty_cos,
+                "actions": {
+                    "prefer_ops": list(self.direction_feedback.actions.prefer_ops),
+                    "avoid_ops": list(self.direction_feedback.actions.avoid_ops),
+                    "max_param_increase_pct": self.direction_feedback.actions.max_param_increase_pct,
                 },
             },
+
         }
 
     def to_yaml(self, path: Union[str, Path]) -> None:
