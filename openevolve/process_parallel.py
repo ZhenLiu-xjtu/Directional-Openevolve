@@ -30,6 +30,7 @@ except Exception:
     RunningStats = None
     DirectionTracker = None
 
+
 # ---- fallback 目标向量（无外部模块也可跑） ----
 def _fallback_target_vector(metrics: dict, weights: dict) -> List[float]:
     """
@@ -37,18 +38,18 @@ def _fallback_target_vector(metrics: dict, weights: dict) -> List[float]:
     v = [score, -macs, -params, -latency_ms, -mem_mb] × 对应权重
     """
     score = float(metrics.get("combined_score", -1e9))
-    macs  = float(metrics.get("macs", metrics.get("flops", 0.0)))
+    macs = float(metrics.get("macs", metrics.get("flops", 0.0)))
     params = float(metrics.get("params", 0.0))
     latency_ms = float(metrics.get("latency_ms", metrics.get("infer_time_s", 0.0) * 1000.0))
     mem_mb = float(metrics.get("mem_mb", 0.0))
 
     w = weights or {}
     return [
-        (score)        * float(w.get("score", 1.0)),
-        (-macs)        * float(w.get("flops", 0.2)),
-        (-params)      * float(w.get("params", 0.3)),
-        (-latency_ms)  * float(w.get("latency_ms", 0.3)),
-        (-mem_mb)      * float(w.get("mem_mb", 0.2)),
+        (score) * float(w.get("score", 1.0)),
+        (-macs) * float(w.get("flops", 0.2)),
+        (-params) * float(w.get("params", 0.3)),
+        (-latency_ms) * float(w.get("latency_ms", 0.3)),
+        (-mem_mb) * float(w.get("mem_mb", 0.2)),
     ]
 
 
@@ -71,7 +72,7 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
 
-
+import os
 def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     """Initialize worker process with necessary components"""
     global _worker_config
@@ -80,7 +81,8 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     global _worker_llm_ensemble
     global _worker_prompt_sampler
     global _worker_direction_cfg, _worker_running_stats, _worker_dir_tracker
-
+    os.environ.setdefault("OE_DATALOADER_WORKERS", "0")  # 子进程内 DL 一律单进程
+    os.environ.pop("OE_SKIP_TRAIN", None)                # 防止外部环境跳过训练
     from openevolve.config import (
         Config,
         DatabaseConfig,
@@ -191,7 +193,7 @@ def _lazy_init_worker_components():
 
 
 def _run_iteration_worker(
-    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
+        iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
     try:
@@ -221,8 +223,8 @@ def _run_iteration_worker(
         island_programs.sort(key=_score_key, reverse=True)
 
         island_top_programs = island_programs[
-            : _worker_config.prompt.num_top_programs + _worker_config.prompt.num_diverse_programs
-        ]
+                              : _worker_config.prompt.num_top_programs + _worker_config.prompt.num_diverse_programs
+                              ]
         island_previous_programs = island_programs[: _worker_config.prompt.num_top_programs]
 
         # Build prompt
@@ -344,7 +346,7 @@ def _run_iteration_worker(
             if _worker_direction_cfg.get("enabled", False):
                 trained_ok = bool(child_metrics.get("trained", True))
                 has_score = ("combined_score" in child_metrics) and ("combined_score" in parent.metrics)
-                warmup_k  = int(_worker_direction_cfg.get("warmup_k", 3))
+                warmup_k = int(_worker_direction_cfg.get("warmup_k", 3))
 
                 # 补齐 latency_ms（若只有 infer_time_s）
                 if "latency_ms" not in child_metrics and "infer_time_s" in child_metrics:
@@ -363,10 +365,10 @@ def _run_iteration_worker(
                     # 目标向量（优先外部模块，否则 fallback）
                     if (make_target_vector is not None) and (_worker_running_stats is not None):
                         v_parent = make_target_vector(parent.metrics, _worker_running_stats, weights)
-                        v_child  = make_target_vector(child_metrics, _worker_running_stats, weights)
+                        v_child = make_target_vector(child_metrics, _worker_running_stats, weights)
                     else:
                         v_parent = _fallback_target_vector(parent.metrics, weights)
-                        v_child  = _fallback_target_vector(child_metrics, weights)
+                        v_child = _fallback_target_vector(child_metrics, weights)
 
                     improved = (child_metrics["combined_score"] > parent.metrics["combined_score"])
                     dv, slope, slope_avg, st = _worker_dir_tracker.update(
@@ -378,16 +380,19 @@ def _run_iteration_worker(
                     stagnating = (len(st.slopes) >= stagnation_k) and (slope_avg < epsilon)
 
                     # tolist 兼容 numpy 向量
-                    def _tolist(x): return x if isinstance(x, list) else getattr(x, "tolist", lambda: x)()
+                    def _tolist(x):
+                        return x if isinstance(x, list) else getattr(x, "tolist", lambda: x)()
+
                     dir_md = {
                         "target_vec": _tolist(v_child),
-                        "delta_vec":  _tolist(dv),
+                        "delta_vec": _tolist(dv),
                         "slope_on_baseline": float(slope),
                         "slope_mean_k": float(slope_avg),
                         "island_id": int(parent_island),
                         "stagnating": bool(stagnating),
                     }
-                    logger.info(f"[dirfb] isl={parent_island} slope={slope:.3f} mean={slope_avg:.3f} stagnating={stagnating}")
+                    logger.info(
+                        f"[dirfb] isl={parent_island} slope={slope:.3f} mean={slope_avg:.3f} stagnating={stagnating}")
         except Exception as _e:
             logger.warning(f"[dirfb] skipped due to error: {_e}")
 
@@ -485,8 +490,10 @@ class ProcessParallelController:
     def start(self) -> None:
         """Start the process pool"""
         config_dict = self._serialize_config(self.config)
+        ctx = mp.get_context("spawn")
         self.executor = ProcessPoolExecutor(
             max_workers=self.num_workers,
+            mp_context=ctx,  # ✅ 关键新增参数
             initializer=_worker_init,
             initargs=(config_dict, self.evaluation_file),
         )
@@ -520,11 +527,11 @@ class ProcessParallelController:
         return snapshot
 
     async def run_evolution(
-        self,
-        start_iteration: int,
-        max_iterations: int,
-        target_score: Optional[float] = None,
-        checkpoint_callback=None,
+            self,
+            start_iteration: int,
+            max_iterations: int,
+            target_score: Optional[float] = None,
+            checkpoint_callback=None,
     ):
         """Run evolution with process-based parallelism"""
         if not self.executor:
@@ -557,6 +564,7 @@ class ProcessParallelController:
                     completed_iteration = iteration
                     break
             if completed_iteration is None:
+
                 await asyncio.sleep(0.01)
                 continue
 
@@ -608,7 +616,8 @@ class ProcessParallelController:
                         logger.info(f"Metrics: {metrics_str}")
 
                         if self.database.best_program_id == child_program.id:
-                            logger.info(f"🌟 New best solution found at iteration {completed_iteration}: {child_program.id}")
+                            logger.info(
+                                f"🌟 New best solution found at iteration {completed_iteration}: {child_program.id}")
 
                     if (completed_iteration > 0 and completed_iteration % self.config.checkpoint_interval == 0):
                         logger.info(f"Checkpoint interval reached at iteration {completed_iteration}")

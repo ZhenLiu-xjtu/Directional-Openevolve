@@ -1,9 +1,8 @@
-# initial_program.py — minimal baseline for evolution
+# initial_program.py — minimal baseline for evolution (vectorized-safe)
 from __future__ import annotations
 from typing import Tuple, Dict
 import torch
 import torch.nn as nn
-
 
 IN_DIM = 3 * 32 * 32
 NUM_CLASSES = 10
@@ -32,14 +31,13 @@ class LinearLoopLayer(nn.Module):
 
         out = x.new_zeros(B, self.out_features)
 
-        # (no matmul/einsum/@/dot/mm/mv)
         for b in range(B):
+            xb = x[b]  # [in_features]
             for j in range(self.out_features):
-                acc = 0.0
-                for i in range(self.in_features):
-                    acc += x[b, i] * self.weight[j, i]
+
+                acc = (xb * self.weight[j]).sum()
                 if self.bias is not None:
-                    acc += self.bias[j]
+                    acc = acc + self.bias[j]
                 out[b, j] = acc
         return out
 
