@@ -62,7 +62,9 @@ class PromptSampler:
             user_template = self._apply_template_variations(user_template)
 
         improvement_areas = self._render_improvement_areas(program_metrics, previous_programs)
+        direction_guidance = direction_guidance or "Tend towards lower FLOPs; Attempt to tile/unroll and constrain the number of parameters"
 
+        print("direction_guidance:",direction_guidance)
         direction_block = self._build_direction_block(
             evolution_round=evolution_round,
             previous_programs=previous_programs,
@@ -70,7 +72,7 @@ class PromptSampler:
             direction_guidance=direction_guidance,
             program_metrics=program_metrics,
         )
-
+        print("direction_block:",direction_block)
         user_message = user_template.format(
             metrics=metrics_str,
             improvement_areas=improvement_areas,
