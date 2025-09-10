@@ -18,7 +18,7 @@ class PromptSampler:
     def __init__(self, config: PromptConfig, direction_cfg: Optional[object] = None) -> None:
         self.config = config
         self.direction_cfg = direction_cfg
-        self.template_manager = TemplateManager(config.template_dir)
+        self.template_manager = TemplateManager(template_dir=config.template_dir)
         self._system_template_key = "system_message"
         self._user_template_key_diff = "diff_user"
         self._user_template_key_full = "full_rewrite_user"

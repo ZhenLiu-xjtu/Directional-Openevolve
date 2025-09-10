@@ -132,7 +132,11 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
-        **other_keys,
+        **{
+            k: v
+            for k, v in config_dict.items()
+            if k not in ["llm", "prompt", "database", "evaluator"]
+        },
     )
     _worker_evaluation_file = evaluation_file
 
@@ -146,39 +150,31 @@ def _lazy_init_worker_components():
     global _worker_evaluator, _worker_llm_ensemble, _worker_prompt_sampler
 
     if _worker_llm_ensemble is None:
-        # 延迟导入，避免主进程 import 时卡住
-        _llm_ens_mod = _import_or_relative("openevolve.llm.ensemble", ".llm.ensemble")
-        if _llm_ens_mod is None:
-            raise ImportError("Failed to import LLM ensemble module")
-        LLMEnsemble = _llm_ens_mod.LLMEnsemble
+        from openevolve.llm.ensemble import LLMEnsemble
+
         _worker_llm_ensemble = LLMEnsemble(_worker_config.llm.models)
 
     if _worker_prompt_sampler is None:
-        # 传入完整 Config（兼容你在 sampler 里访问 direction_feedback 的写法）
-        _worker_prompt_sampler = PromptSampler(_worker_config)
+        from openevolve.prompt.sampler import PromptSampler
+
+        _worker_prompt_sampler = PromptSampler(_worker_config.prompt)
 
     if _worker_evaluator is None:
-        _llm_ens_mod = _import_or_relative("openevolve.llm.ensemble", ".llm.ensemble")
-        if _llm_ens_mod is None:
-            raise ImportError("Failed to import LLM ensemble module")
-        LLMEnsemble = _llm_ens_mod.LLMEnsemble
+        from openevolve.evaluator import Evaluator
+        from openevolve.llm.ensemble import LLMEnsemble
+        from openevolve.prompt.sampler import PromptSampler
 
-        # evaluator 专用的 llm & prompt
+        # Create evaluator-specific components
         evaluator_llm = LLMEnsemble(_worker_config.llm.evaluator_models)
-        eval_prompt_sampler = PromptSampler(_worker_config)
-        # 如果 sampler 提供模板选择接口就设一下；没有也忽略
-        if hasattr(eval_prompt_sampler, "set_templates"):
-            try:
-                eval_prompt_sampler.set_templates("evaluator_system_message")
-            except Exception:
-                pass
+        evaluator_prompt = PromptSampler(_worker_config.prompt)
+        evaluator_prompt.set_templates("evaluator_system_message")
 
         _worker_evaluator = Evaluator(
             _worker_config.evaluator,
             _worker_evaluation_file,
             evaluator_llm,
-            eval_prompt_sampler,
-            database=None,  # worker 内不共享 DB
+            evaluator_prompt,
+            database=None,  # No shared database in worker
         )
 
 
