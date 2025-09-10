@@ -16,7 +16,20 @@ BASE_EVALUATOR_SYSTEM_TEMPLATE = """You are an expert code reviewer.
 Your job is to analyze the provided code and evaluate it systematically."""
 
 # User message template for diff-based evolution
-DIFF_USER_TEMPLATE = """# Current Program Information
+DIFF_USER_TEMPLATE = """# 
+
+- Do NOT introduce new Python identifiers that are not present in the current program context
+  (e.g., keep variable names like `x`, `labels`, etc. unchanged). In particular, do not invent
+  variables such as `xb` if they do not already exist.
+- Do NOT change function/class signatures (keep `forward(self, x)` and return types the same).
+- Do NOT use forbidden APIs: `nn.Linear`, `torch.matmul`, `torch.mm`, `einsum`, the `@` operator,
+  `F.linear`, or any high-level linear layers. If you need matrix multiplication, implement it
+  explicitly with nested for-loops only.
+- Keep tensor device/dtype unchanged. Do not move tensors across devices.
+- Keep label ranges valid (e.g., 0..num_classes-1). Do not create out-of-range indices.
+- Only modify code inside the patch region; do NOT rewrite unrelated parts of the file.
+
+Current Program Information
 - Current performance metrics: {metrics}
 - Areas identified for improvement: {improvement_areas}
 

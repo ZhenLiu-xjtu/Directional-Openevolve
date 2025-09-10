@@ -5,64 +5,87 @@ Process-based parallel controller for true parallelism
 import asyncio
 import logging
 import multiprocessing as mp
+import os
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from concurrent.futures import ProcessPoolExecutor, Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures.process import BrokenProcessPool
+
+logger = logging.getLogger(__name__)
+
+# ---------- 安全导入（绝对优先，失败再相对），并为可选依赖提供兜底 ----------
+
+def _import_or_relative(abs_path: str, rel_path: str):
+    mod = None
+    try:
+        mod = __import__(abs_path, fromlist=['*'])
+    except Exception:
+        try:
+            mod = __import__(rel_path, fromlist=['*'])
+        except Exception:
+            mod = None
+    return mod
+
+# config / database / evaluator / sampler / utils
+_cfg_mod = _import_or_relative("openevolve.config", ".config")
+_db_mod  = _import_or_relative("openevolve.database", ".database")
+_eval_mod = _import_or_relative("openevolve.evaluator", ".evaluator")
+_sampler_mod = _import_or_relative("openevolve.prompt.sampler", ".prompt.sampler")
+
+_utils_metrics = _import_or_relative("openevolve.utils.metrics_utils", ".utils.metrics_utils")
+_utils_code = _import_or_relative("openevolve.utils.code_utils", ".utils.code_utils")
+
+if _cfg_mod is None or _db_mod is None or _eval_mod is None or _sampler_mod is None:
+    raise ImportError("Failed to import openevolve core modules (config/database/evaluator/sampler)")
+
+Config = _cfg_mod.Config
+DatabaseConfig = getattr(_cfg_mod, "DatabaseConfig")
+EvaluatorConfig = getattr(_cfg_mod, "EvaluatorConfig")
+LLMConfig = getattr(_cfg_mod, "LLMConfig")
+PromptConfig = getattr(_cfg_mod, "PromptConfig")
+LLMModelConfig = getattr(_cfg_mod, "LLMModelConfig")
+
+
+from openevolve.database import Program, ProgramDatabase
+import asyncio
+import logging
+import multiprocessing as mp
 import pickle
 import signal
 import time
-from concurrent.futures import ProcessPoolExecutor, Future
+from concurrent.futures import ProcessPoolExecutor, Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
+from openevolve.utils.metrics_utils import safe_numeric_average
+Evaluator = _eval_mod.Evaluator
+PromptSampler = _sampler_mod.PromptSampler
 
-# provide a module-wide alias to avoid shadowing in inner scopes
-dc_asdict = asdict
+# safe_numeric_average 兜底
+if _utils_metrics and hasattr(_utils_metrics, "safe_numeric_average"):
+    safe_numeric_average = _utils_metrics.safe_numeric_average
+else:
+    def safe_numeric_average(metrics: Dict[str, Any]) -> float:
+        nums = [v for v in metrics.values() if isinstance(v, (int, float))]
+        return sum(nums) / len(nums) if nums else 0.0
 
-logger = logging.getLogger(__name__)
-
-# === Directional Feedback globals (safe imports) ===
-try:
-    from openevolve.metrics.target_space import make_target_vector, RunningStats
-    from openevolve.direction import DirectionTracker
-except Exception:
-    make_target_vector = None
-    RunningStats = None
-    DirectionTracker = None
-
-
-# ---- fallback 目标向量（无外部模块也可跑） ----
-def _fallback_target_vector(metrics: dict, weights: dict) -> List[float]:
-    """
-    极简版目标向量（越大越好）：
-    v = [score, -macs, -params, -latency_ms, -mem_mb] × 对应权重
-    """
-    score = float(metrics.get("combined_score", -1e9))
-    macs = float(metrics.get("macs", metrics.get("flops", 0.0)))
-    params = float(metrics.get("params", 0.0))
-    latency_ms = float(metrics.get("latency_ms", metrics.get("infer_time_s", 0.0) * 1000.0))
-    mem_mb = float(metrics.get("mem_mb", 0.0))
-
-    w = weights or {}
-    return [
-        (score) * float(w.get("score", 1.0)),
-        (-macs) * float(w.get("flops", 0.2)),
-        (-params) * float(w.get("params", 0.3)),
-        (-latency_ms) * float(w.get("latency_ms", 0.3)),
-        (-mem_mb) * float(w.get("mem_mb", 0.2)),
-    ]
-
-
-# worker 侧全局（在 _worker_init 里赋值）
-_worker_direction_cfg = None
-_worker_running_stats = None
-_worker_dir_tracker = None
+# 代码解析函数兜底
+_extract_diffs = getattr(_utils_code, "extract_diffs", None) if _utils_code else None
+_apply_diff = getattr(_utils_code, "apply_diff", None) if _utils_code else None
+_format_diff_summary = getattr(_utils_code, "format_diff_summary", None) if _utils_code else None
+_parse_full_rewrite = getattr(_utils_code, "parse_full_rewrite", None) if _utils_code else None
 
 
 @dataclass
 class SerializableResult:
     """Result that can be pickled and sent between processes"""
-
     child_program_dict: Optional[Dict[str, Any]] = None
     parent_id: Optional[str] = None
     iteration_time: float = 0.0
@@ -72,334 +95,185 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
 
-import os
-def _worker_init(config_dict: dict, evaluation_file: str) -> None:
-    """Initialize worker process with necessary components"""
-    global _worker_config
-    global _worker_evaluation_file
-    global _worker_evaluator
-    global _worker_llm_ensemble
-    global _worker_prompt_sampler
-    global _worker_direction_cfg, _worker_running_stats, _worker_dir_tracker
-    os.environ.setdefault("OE_DATALOADER_WORKERS", "0")  # 子进程内 DL 一律单进程
-    os.environ.pop("OE_SKIP_TRAIN", None)                # 防止外部环境跳过训练
-    from openevolve.config import (
-        Config,
-        DatabaseConfig,
-        EvaluatorConfig,
-        LLMConfig,
-        PromptConfig,
-        LLMModelConfig,
-        DirectionFeedbackConfig,
-    )
 
-    # Reconstruct model objects
+# ------------- Worker 全局（由 initializer 设置） -------------
+_worker_config = None
+_worker_evaluation_file = None
+_worker_evaluator = None
+_worker_llm_ensemble = None
+_worker_prompt_sampler = None
+
+
+def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
+    """Initialize worker process with necessary components"""
+    # 继承主进程环境变量（例如 API Key、调试开关等）
+    if parent_env:
+        os.environ.update(parent_env)
+
+    global _worker_config, _worker_evaluation_file
+    global _worker_evaluator, _worker_llm_ensemble, _worker_prompt_sampler
+
+    # 重建 LLMConfig（包含 models & evaluator_models）
     models = [LLMModelConfig(**m) for m in config_dict["llm"]["models"]]
     evaluator_models = [LLMModelConfig(**m) for m in config_dict["llm"]["evaluator_models"]]
-
-    # Create LLM config with models
-    llm_dict = config_dict["llm"].copy()
+    llm_dict = dict(config_dict["llm"])
     llm_dict["models"] = models
     llm_dict["evaluator_models"] = evaluator_models
     llm_config = LLMConfig(**llm_dict)
 
-    # Create other configs
     prompt_config = PromptConfig(**config_dict["prompt"])
     database_config = DatabaseConfig(**config_dict["database"])
     evaluator_config = EvaluatorConfig(**config_dict["evaluator"])
 
-    # Direction feedback: rebuild dataclass & dict view
-    raw_df = config_dict.get("direction_feedback", None)
-    if isinstance(raw_df, dict):
-        df_obj = DirectionFeedbackConfig(**raw_df)
-    elif isinstance(raw_df, DirectionFeedbackConfig):
-        df_obj = raw_df
-    else:
-        df_obj = DirectionFeedbackConfig()  # 默认关闭
-
-    _worker_direction_cfg = dc_asdict(df_obj)
+    other_keys = {k: v for k, v in config_dict.items() if k not in ["llm", "prompt", "database", "evaluator"]}
 
     _worker_config = Config(
         llm=llm_config,
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
-        direction_feedback=df_obj,  # 强类型对象，便于属性访问
-        **{
-            k: v
-            for k, v in config_dict.items()
-            if k not in ["llm", "prompt", "database", "evaluator", "direction_feedback"]
-        },
+        **other_keys,
     )
     _worker_evaluation_file = evaluation_file
 
-    # These will be lazily initialized on first use
     _worker_evaluator = None
     _worker_llm_ensemble = None
     _worker_prompt_sampler = None
 
-    # 只有打开开关且模块可用才启用 RunningStats
-    if _worker_direction_cfg.get("enabled", False) and RunningStats is not None:
-        _worker_running_stats = RunningStats(
-            mean={"combined_score": 0, "params": 0, "latency_ms": 0, "flops": 0, "mem_mb": 0},
-            std={"combined_score": 1, "params": 1, "latency_ms": 1, "flops": 1, "mem_mb": 1},
-            count=0,
-        )
-    else:
-        _worker_running_stats = None
-
-    _worker_dir_tracker = None  # 真正创建放在 lazy 初始化
-
 
 def _lazy_init_worker_components():
     """Lazily initialize expensive components on first use"""
-    global _worker_evaluator
-    global _worker_llm_ensemble
-    global _worker_prompt_sampler
-    global _worker_dir_tracker, _worker_direction_cfg
+    global _worker_evaluator, _worker_llm_ensemble, _worker_prompt_sampler
 
     if _worker_llm_ensemble is None:
-        from openevolve.llm.ensemble import LLMEnsemble
+        # 延迟导入，避免主进程 import 时卡住
+        _llm_ens_mod = _import_or_relative("openevolve.llm.ensemble", ".llm.ensemble")
+        if _llm_ens_mod is None:
+            raise ImportError("Failed to import LLM ensemble module")
+        LLMEnsemble = _llm_ens_mod.LLMEnsemble
         _worker_llm_ensemble = LLMEnsemble(_worker_config.llm.models)
 
     if _worker_prompt_sampler is None:
-        from openevolve.prompt.sampler import PromptSampler
-        _worker_prompt_sampler = PromptSampler(_worker_config.prompt,
-                                               _worker_config.direction_feedback)
+        # 传入完整 Config（兼容你在 sampler 里访问 direction_feedback 的写法）
+        _worker_prompt_sampler = PromptSampler(_worker_config)
 
     if _worker_evaluator is None:
-        from openevolve.evaluator import Evaluator
-        from openevolve.llm.ensemble import LLMEnsemble
-        from openevolve.prompt.sampler import PromptSampler
+        _llm_ens_mod = _import_or_relative("openevolve.llm.ensemble", ".llm.ensemble")
+        if _llm_ens_mod is None:
+            raise ImportError("Failed to import LLM ensemble module")
+        LLMEnsemble = _llm_ens_mod.LLMEnsemble
 
+        # evaluator 专用的 llm & prompt
         evaluator_llm = LLMEnsemble(_worker_config.llm.evaluator_models)
-        evaluator_prompt = PromptSampler(_worker_config.prompt)
-        evaluator_prompt.set_templates("evaluator_system_message")
+        eval_prompt_sampler = PromptSampler(_worker_config)
+        # 如果 sampler 提供模板选择接口就设一下；没有也忽略
+        if hasattr(eval_prompt_sampler, "set_templates"):
+            try:
+                eval_prompt_sampler.set_templates("evaluator_system_message")
+            except Exception:
+                pass
 
         _worker_evaluator = Evaluator(
             _worker_config.evaluator,
             _worker_evaluation_file,
             evaluator_llm,
-            evaluator_prompt,
-            database=None,
+            eval_prompt_sampler,
+            database=None,  # worker 内不共享 DB
         )
-        # === Directional Feedback: lazy init DirectionTracker ===
-        if _worker_dir_tracker is None and _worker_direction_cfg.get("enabled", False) and DirectionTracker is not None:
-            _worker_dir_tracker = DirectionTracker(
-                dim=5,  # score/params/latency/flops/mem
-                k_window=int(_worker_direction_cfg.get("k_window", 8)),
-                ema_decay=float(_worker_direction_cfg.get("ema_decay", 0.8)),
-            )
 
 
 def _run_iteration_worker(
-        iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
+    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
     try:
-        # Lazy initialization
         _lazy_init_worker_components()
 
-        # Reconstruct programs from snapshot
+        # 重建 Program 对象池
         programs = {pid: Program(**prog_dict) for pid, prog_dict in db_snapshot["programs"].items()}
-
         parent = programs[parent_id]
         inspirations = [programs[pid] for pid in inspiration_ids if pid in programs]
 
-        # Get parent artifacts if available
+        # 上下文信息
         parent_artifacts = db_snapshot["artifacts"].get(parent_id)
+        parent_island = parent.metadata.get("island", db_snapshot.get("current_island", 0))
+        island_programs = [programs[pid] for pid in db_snapshot["islands"][parent_island] if pid in programs]
 
-        # Get island-specific programs for context
-        parent_island = parent.metadata.get("island", db_snapshot["current_island"])
-        island_programs = [
-            programs[pid] for pid in db_snapshot["islands"][parent_island] if pid in programs
-        ]
+        # 选出用于展示/灵感的程序
+        island_programs.sort(
+            key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
+            reverse=True,
+        )
+        num_top = _worker_config.prompt.num_top_programs
+        num_div = _worker_config.prompt.num_diverse_programs
+        programs_for_prompt = island_programs[: num_top + num_div]
+        best_programs_only = island_programs[: num_top]
 
-        # === 排序：缺失 combined_score 视为 -inf，稳定 ===
-        def _score_key(p):
-            m = p.metrics or {}
-            return m["combined_score"] if "combined_score" in m else float("-inf")
-
-        island_programs.sort(key=_score_key, reverse=True)
-
-        island_top_programs = island_programs[
-                              : _worker_config.prompt.num_top_programs + _worker_config.prompt.num_diverse_programs
-                              ]
-        island_previous_programs = island_programs[: _worker_config.prompt.num_top_programs]
-
-        # Build prompt
+        # 组装 prompt
         prompt = _worker_prompt_sampler.build_prompt(
             current_program=parent.code,
             parent_program=parent.code,
             program_metrics=parent.metrics,
-            previous_programs=[p.to_dict() for p in island_previous_programs],
-            top_programs=[p.to_dict() for p in island_top_programs],
+            previous_programs=[p.to_dict() for p in best_programs_only],
+            top_programs=[p.to_dict() for p in programs_for_prompt],
             inspirations=[p.to_dict() for p in inspirations],
             language=_worker_config.language,
             evolution_round=iteration,
             diff_based_evolution=_worker_config.diff_based_evolution,
             program_artifacts=parent_artifacts,
-            parent_program_dict=parent.to_dict(),
+            feature_dimensions=db_snapshot.get("feature_dimensions", []),
         )
 
         iteration_start = time.time()
 
-        # Generate code modification (sync wrapper for async)
-        llm_response = asyncio.run(
-            _worker_llm_ensemble.generate_with_context(
-                system_message=prompt["system"],
-                messages=[{"role": "user", "content": prompt["user"]}],
+        # 生成修改
+        _llm_ens_mod = _import_or_relative("openevolve.llm.ensemble", ".llm.ensemble")
+        LLMEnsemble = _llm_ens_mod.LLMEnsemble  # noqa
+        try:
+            llm_response = asyncio.run(
+                _worker_llm_ensemble.generate_with_context(
+                    system_message=prompt["system"],
+                    messages=[{"role": "user", "content": prompt["user"]}],
+                )
             )
-        )
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
 
-        # ======= 解析响应：diff → (失败) format-fix → (失败) full-rewrite =======
-        child_code = None
-        changes_summary = None
+        if llm_response is None:
+            return SerializableResult(error="LLM returned None response", iteration=iteration)
 
+        # 解析代码
         if _worker_config.diff_based_evolution:
-            from openevolve.utils.code_utils import extract_diffs, apply_diff, format_diff_summary, parse_full_rewrite
-
-            # 1) 尝试直接按补丁解析
-            diff_blocks = extract_diffs(llm_response)
-            if diff_blocks:
-                child_code = apply_diff(parent.code, llm_response)
-                changes_summary = format_diff_summary(diff_blocks)
-            else:
-                # 2) 一次“格式修复”重试（只要求把上一轮内容转成 PATCH 块）
-                fix_system = "You are a formatter. Convert the user's intent into STRICT PATCH blocks only."
-                fix_user = (
-                    "Your previous answer did not follow the required PATCH format.\n"
-                    "Reformat it into one or more PATCH blocks using this exact syntax:\n\n"
-                    "PATCH:\nSEARCH:\n<old lines>\nREPLACE:\n<new lines>\nENDPATCH\n\n"
-                    "Do not change semantics, only convert the format.\n"
-                    "Previous answer:\n"
-                    f"{llm_response[:4000]}"
-                )
-                llm_fix = asyncio.run(
-                    _worker_llm_ensemble.generate_with_context(
-                        system_message=fix_system,
-                        messages=[{"role": "user", "content": fix_user}],
-                    )
-                )
-                diff_blocks = extract_diffs(llm_fix)
-                if diff_blocks:
-                    child_code = apply_diff(parent.code, llm_fix)
-                    changes_summary = "Format-fixed patch"
-                else:
-                    # 3) 最后兜底：尝试当作“全量重写”解析
-                    new_code = parse_full_rewrite(llm_response, _worker_config.language)
-                    if new_code:
-                        child_code = new_code
-                        changes_summary = "Fallback full rewrite"
-                    else:
-                        return SerializableResult(error="No valid diffs or rewrite found in response",
-                                                  iteration=iteration)
+            if not (_extract_diffs and _apply_diff and _format_diff_summary):
+                return SerializableResult(error="Diff utilities not available", iteration=iteration)
+            diff_blocks = _extract_diffs(llm_response)
+            if not diff_blocks:
+                return SerializableResult(error="No valid diffs found in response", iteration=iteration)
+            child_code = _apply_diff(parent.code, llm_response)
+            changes_summary = _format_diff_summary(diff_blocks)
         else:
-            from openevolve.utils.code_utils import parse_full_rewrite
-            new_code = parse_full_rewrite(llm_response, _worker_config.language)
-            if not new_code:
-                # 尝试用上面的“格式修复”再来一次
-                fix_system = "You are a formatter. Convert the user's intent into a FULL PROGRAM in the target language only."
-                fix_user = (
-                    "Output ONLY the improved full program. No prose, no fences. "
-                    "Previous answer:\n"
-                    f"{llm_response[:4000]}"
-                )
-                llm_fix = asyncio.run(
-                    _worker_llm_ensemble.generate_with_context(
-                        system_message=fix_system,
-                        messages=[{"role": "user", "content": fix_user}],
-                    )
-                )
-                new_code = parse_full_rewrite(llm_fix, _worker_config.language)
-
+            if not _parse_full_rewrite:
+                return SerializableResult(error="Rewrite parser not available", iteration=iteration)
+            new_code = _parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
                 return SerializableResult(error="No valid code found in response", iteration=iteration)
             child_code = new_code
             changes_summary = "Full rewrite"
 
-        # Code length guard
+        # 长度限制
         if len(child_code) > _worker_config.max_code_length:
             return SerializableResult(
                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
                 iteration=iteration,
             )
 
-        # Evaluate child
+        # 评估
         import uuid
         child_id = str(uuid.uuid4())
         child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
-
-        # Normalize metrics: no score → very low score
-        try:
-            if "combined_score" not in child_metrics:
-                child_metrics = dict(child_metrics)
-                child_metrics["combined_score"] = -1e9
-                child_metrics["invalid_missing_score"] = 1.0
-                logger.warning("Evaluator returned no combined_score; forcing very low score for child %s", child_id)
-        except Exception as _e:
-            logger.warning("Failed to normalize child_metrics for %s: %s", child_id, _e)
-
-        # === Directional Feedback: slope/plateau with warm-up & invalid shielding (+ fallback vector) ===
-        dir_md = {}
-        try:
-            if _worker_direction_cfg.get("enabled", False):
-                trained_ok = bool(child_metrics.get("trained", True))
-                has_score = ("combined_score" in child_metrics) and ("combined_score" in parent.metrics)
-                warmup_k = int(_worker_direction_cfg.get("warmup_k", 3))
-
-                # 补齐 latency_ms（若只有 infer_time_s）
-                if "latency_ms" not in child_metrics and "infer_time_s" in child_metrics:
-                    child_metrics = dict(child_metrics)
-                    child_metrics["latency_ms"] = child_metrics["infer_time_s"] * 1000.0
-
-                if (iteration < warmup_k) or (not trained_ok) or (not has_score) or (_worker_dir_tracker is None):
-                    dir_md = {
-                        "island_id": int(parent_island),
-                        "warmup": iteration < warmup_k,
-                        "invalid": (not trained_ok) or (not has_score) or (_worker_dir_tracker is None),
-                    }
-                else:
-                    weights = _worker_direction_cfg.get("weights", {}) or {}
-
-                    # 目标向量（优先外部模块，否则 fallback）
-                    if (make_target_vector is not None) and (_worker_running_stats is not None):
-                        v_parent = make_target_vector(parent.metrics, _worker_running_stats, weights)
-                        v_child = make_target_vector(child_metrics, _worker_running_stats, weights)
-                    else:
-                        v_parent = _fallback_target_vector(parent.metrics, weights)
-                        v_child = _fallback_target_vector(child_metrics, weights)
-
-                    improved = (child_metrics["combined_score"] > parent.metrics["combined_score"])
-                    dv, slope, slope_avg, st = _worker_dir_tracker.update(
-                        island_id=parent_island, v_parent=v_parent, v_child=v_child, improved=improved
-                    )
-
-                    stagnation_k = int(_worker_direction_cfg.get("stagnation_k", 6))
-                    epsilon = float(_worker_direction_cfg.get("epsilon", 0.01))
-                    stagnating = (len(st.slopes) >= stagnation_k) and (slope_avg < epsilon)
-
-                    # tolist 兼容 numpy 向量
-                    def _tolist(x):
-                        return x if isinstance(x, list) else getattr(x, "tolist", lambda: x)()
-
-                    dir_md = {
-                        "target_vec": _tolist(v_child),
-                        "delta_vec": _tolist(dv),
-                        "slope_on_baseline": float(slope),
-                        "slope_mean_k": float(slope_avg),
-                        "island_id": int(parent_island),
-                        "stagnating": bool(stagnating),
-                    }
-                    logger.info(
-                        f"[dirfb] isl={parent_island} slope={slope:.3f} mean={slope_avg:.3f} stagnating={stagnating}")
-        except Exception as _e:
-            logger.warning(f"[dirfb] skipped due to error: {_e}")
-
-        # Artifacts
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
 
-        # Create child program
         child_program = Program(
             id=child_id,
             code=child_code,
@@ -412,7 +286,6 @@ def _run_iteration_worker(
                 "changes": changes_summary,
                 "parent_metrics": parent.metrics,
                 "island": parent_island,
-                **dir_md,
             },
         )
 
@@ -436,22 +309,26 @@ def _run_iteration_worker(
 class ProcessParallelController:
     """Controller for process-based parallel evolution"""
 
-    def __init__(self, config: Config, evaluation_file: str, database: ProgramDatabase):
+    def __init__(self, config: Config, evaluation_file: str, database: ProgramDatabase, evolution_tracer=None):
         self.config = config
         self.evaluation_file = evaluation_file
         self.database = database
+        self.evolution_tracer = evolution_tracer
 
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
+        self.early_stopping_triggered = False
 
-        # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
+        self.num_islands = config.database.num_islands
+        self.worker_island_map = {wid: (wid % self.num_islands) for wid in range(self.num_workers)}
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
+        logger.info(f"Worker-to-island mapping: {self.worker_island_map}")
 
+    # ----------- 序列化配置（不夹带复杂类型，避免子进程反序列化问题）-----------
     def _serialize_config(self, config: Config) -> dict:
-        """Serialize config object to a dictionary that can be pickled"""
-        cfg_dict = {
+        return {
             "llm": {
                 "models": [asdict(m) for m in config.llm.models],
                 "evaluator_models": [asdict(m) for m in config.llm.evaluator_models],
@@ -475,27 +352,21 @@ class ProcessParallelController:
             "diff_based_evolution": config.diff_based_evolution,
             "max_code_length": config.max_code_length,
             "language": config.language,
+            "early_stopping_patience": getattr(config, "early_stopping_patience", None),
+            "convergence_threshold": getattr(config, "convergence_threshold", 0.0),
+            "early_stopping_metric": getattr(config, "early_stopping_metric", "combined_score"),
         }
 
-        # serialize direction_feedback as dict for worker
-        if hasattr(config, "direction_feedback") and config.direction_feedback is not None:
-            try:
-                cfg_dict["direction_feedback"] = dc_asdict(config.direction_feedback)
-            except Exception:
-                df = config.direction_feedback
-                cfg_dict["direction_feedback"] = getattr(df, "__dict__", {})
-
-        return cfg_dict
-
     def start(self) -> None:
-        """Start the process pool"""
+        """Start the process pool (use spawn to avoid autograd+fork issues)"""
         config_dict = self._serialize_config(self.config)
+        current_env = dict(os.environ)
         ctx = mp.get_context("spawn")
         self.executor = ProcessPoolExecutor(
             max_workers=self.num_workers,
-            mp_context=ctx,  # ✅ 关键新增参数
+            mp_context=ctx,
             initializer=_worker_init,
-            initargs=(config_dict, self.evaluation_file),
+            initargs=(config_dict, self.evaluation_file, current_env),
         )
         logger.info(f"Started process pool with {self.num_workers} processes")
 
@@ -503,23 +374,23 @@ class ProcessParallelController:
         """Stop the process pool"""
         self.shutdown_event.set()
         if self.executor:
-            self.executor.shutdown(wait=True)
+            self.executor.shutdown(wait=True, cancel_futures=True)
             self.executor = None
         logger.info("Stopped process pool")
 
     def request_shutdown(self) -> None:
-        """Request graceful shutdown"""
         logger.info("Graceful shutdown requested...")
         self.shutdown_event.set()
 
     def _create_database_snapshot(self) -> Dict[str, Any]:
-        """Create a serializable snapshot of the database state"""
         snapshot = {
             "programs": {pid: prog.to_dict() for pid, prog in self.database.programs.items()},
             "islands": [list(island) for island in self.database.islands],
             "current_island": self.database.current_island,
+            "feature_dimensions": self.database.config.feature_dimensions,
             "artifacts": {},
         }
+        # 限制 artifacts 数量，避免大量 pickle 传输
         for pid in list(self.database.programs.keys())[:100]:
             artifacts = self.database.get_artifacts(pid)
             if artifacts:
@@ -527,13 +398,12 @@ class ProcessParallelController:
         return snapshot
 
     async def run_evolution(
-            self,
-            start_iteration: int,
-            max_iterations: int,
-            target_score: Optional[float] = None,
-            checkpoint_callback=None,
+        self,
+        start_iteration: int,
+        max_iterations: int,
+        target_score: Optional[float] = None,
+        checkpoint_callback=None,
     ):
-        """Run evolution with process-based parallelism"""
         if not self.executor:
             raise RuntimeError("Process pool not started")
 
@@ -544,44 +414,124 @@ class ProcessParallelController:
         )
 
         pending_futures: Dict[int, Future] = {}
+        island_pending: Dict[int, List[int]] = {i: [] for i in range(self.num_islands)}
         batch_size = min(self.num_workers * 2, max_iterations)
 
-        for i in range(start_iteration, min(start_iteration + batch_size, total_iterations)):
-            future = self._submit_iteration(i)
-            if future:
-                pending_futures[i] = future
+        batch_per_island = max(1, batch_size // self.num_islands) if batch_size > 0 else 0
+        current_iteration = start_iteration
 
-        next_iteration = start_iteration + batch_size
+        # 初始化一批任务
+        for island_id in range(self.num_islands):
+            for _ in range(batch_per_island):
+                if current_iteration < total_iterations:
+                    future = self._submit_iteration(current_iteration, island_id)
+                    if future:
+                        pending_futures[current_iteration] = future
+                        island_pending[island_id].append(current_iteration)
+                    current_iteration += 1
+
+        next_iteration = current_iteration
         completed_iterations = 0
 
         programs_per_island = max(1, max_iterations // (self.config.database.num_islands * 10))
         current_island_counter = 0
 
-        while pending_futures and completed_iterations < max_iterations and not self.shutdown_event.is_set():
-            completed_iteration = None
-            for iteration, future in list(pending_futures.items()):
-                if future.done():
-                    completed_iteration = iteration
-                    break
-            if completed_iteration is None:
+        early_stopping_enabled = self.config.early_stopping_patience is not None
+        if early_stopping_enabled:
+            best_score = float("-inf")
+            iterations_without_improvement = 0
+            logger.info(
+                f"Early stopping enabled: patience={self.config.early_stopping_patience}, "
+                f"threshold={self.config.convergence_threshold}, "
+                f"metric={self.config.early_stopping_metric}"
+            )
+        else:
+            logger.info("Early stopping disabled")
 
+        while (
+            pending_futures
+            and completed_iterations < max_iterations
+            and not self.shutdown_event.is_set()
+        ):
+            completed_iteration = None
+            for it, fut in list(pending_futures.items()):
+                if fut.done():
+                    completed_iteration = it
+                    break
+
+            if completed_iteration is None:
                 await asyncio.sleep(0.01)
                 continue
 
             future = pending_futures.pop(completed_iteration)
+
             try:
-                result = future.result()
+                timeout_seconds = self.config.evaluator.timeout + 30
+                result: SerializableResult = future.result(timeout=timeout_seconds)
 
                 if result.error:
                     logger.warning(f"Iteration {completed_iteration} error: {result.error}")
                 elif result.child_program_dict:
                     child_program = Program(**result.child_program_dict)
-                    child_program.metadata = child_program.metadata or {}
+
+                    # 入库（继承 parent 的 island）
                     self.database.add(child_program, iteration=completed_iteration)
 
                     if result.artifacts:
                         self.database.store_artifacts(child_program.id, result.artifacts)
 
+                    # ------- 兼容你的 evolution_tracer 参数命名（program / program_info 都支持）-------
+                    if self.evolution_tracer and hasattr(self.evolution_tracer, "log_trace"):
+                        try:
+                            import inspect
+                            sig = inspect.signature(self.evolution_tracer.log_trace)
+                            accepted = set(sig.parameters.keys())
+
+                            parent_program = self.database.get(result.parent_id) if result.parent_id else None
+                            island_id = child_program.metadata.get("island", self.database.current_island)
+
+                            # 构造 info 版本（轻量）
+                            parent_info = None
+                            if parent_program:
+                                parent_info = {
+                                    "id": parent_program.id,
+                                    "metrics": parent_program.metrics,
+                                    "generation": parent_program.generation,
+                                    "metadata": parent_program.metadata,
+                                }
+                            child_info = {
+                                "id": child_program.id,
+                                "metrics": child_program.metrics,
+                                "generation": child_program.generation,
+                                "metadata": child_program.metadata,
+                            }
+
+                            payload = {
+                                "iteration": completed_iteration,
+                                "island_id": island_id,
+                                "prompt": result.prompt,
+                                "llm_response": result.llm_response,
+                                "artifacts": result.artifacts,
+                                "metadata": {
+                                    "iteration_time": result.iteration_time,
+                                    "changes": child_program.metadata.get("changes", ""),
+                                },
+                            }
+                            # 两套字段名都尝试：有啥传啥
+                            if "parent_program" in accepted and parent_program is not None:
+                                payload["parent_program"] = parent_program
+                            if "child_program" in accepted:
+                                payload["child_program"] = child_program
+                            if "parent_program_info" in accepted and parent_info is not None:
+                                payload["parent_program_info"] = parent_info
+                            if "child_program_info" in accepted:
+                                payload["child_program_info"] = child_info
+
+                            self.evolution_tracer.log_trace(**{k: v for k, v in payload.items() if k in accepted})
+                        except Exception as te:
+                            logger.debug(f"evolution_tracer.log_trace failed gracefully: {te}")
+
+                    # 记录 prompt
                     if result.prompt:
                         self.database.log_prompt(
                             template_key=("full_rewrite_user" if not self.config.diff_based_evolution else "diff_user"),
@@ -590,7 +540,8 @@ class ProcessParallelController:
                             responses=[result.llm_response] if result.llm_response else [],
                         )
 
-                    if (completed_iteration > start_iteration and current_island_counter >= programs_per_island):
+                    # 岛屿轮换 & 迁移
+                    if completed_iteration > start_iteration and current_island_counter >= programs_per_island:
                         self.database.next_island()
                         current_island_counter = 0
                         logger.debug(f"Switched to island {self.database.current_island}")
@@ -603,11 +554,12 @@ class ProcessParallelController:
                         self.database.migrate_programs()
                         self.database.log_island_status()
 
+                    # 日志
                     logger.info(
-                        f"Iteration {completed_iteration}: Program {child_program.id} "
-                        f"(parent: {result.parent_id}) completed in {result.iteration_time:.2f}s"
+                        f"Iteration {completed_iteration}: "
+                        f"Program {child_program.id} (parent: {result.parent_id}) "
+                        f"completed in {result.iteration_time:.2f}s"
                     )
-
                     if child_program.metrics:
                         metrics_str = ", ".join(
                             [f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
@@ -615,56 +567,158 @@ class ProcessParallelController:
                         )
                         logger.info(f"Metrics: {metrics_str}")
 
-                        if self.database.best_program_id == child_program.id:
-                            logger.info(
-                                f"🌟 New best solution found at iteration {completed_iteration}: {child_program.id}")
+                        if not hasattr(self, "_warned_about_combined_score"):
+                            self._warned_about_combined_score = False
+                        if "combined_score" not in child_program.metrics and not self._warned_about_combined_score:
+                            avg_score = safe_numeric_average(child_program.metrics)
+                            logger.warning(
+                                f"⚠️  No 'combined_score' in metrics; using safe average ({avg_score:.4f}) for guidance. "
+                                f"Consider returning a proper 'combined_score' in evaluator."
+                            )
+                            self._warned_about_combined_score = True
 
-                    if (completed_iteration > 0 and completed_iteration % self.config.checkpoint_interval == 0):
+                    if self.database.best_program_id == child_program.id:
+                        logger.info(f"🌟 New best solution found at iteration {completed_iteration}: {child_program.id}")
+
+                    # Checkpoint
+                    if completed_iteration > 0 and completed_iteration % self.config.checkpoint_interval == 0:
                         logger.info(f"Checkpoint interval reached at iteration {completed_iteration}")
                         self.database.log_island_status()
                         if checkpoint_callback:
                             checkpoint_callback(completed_iteration)
 
+                    # 目标分数
                     if target_score is not None and child_program.metrics:
-                        numeric_metrics = [v for v in child_program.metrics.values() if isinstance(v, (int, float))]
-                        if numeric_metrics:
-                            avg_score = sum(numeric_metrics) / len(numeric_metrics)
-                            if avg_score >= target_score:
-                                logger.info(f"Target score {target_score} reached at iteration {completed_iteration}")
+                        nums = [v for v in child_program.metrics.values() if isinstance(v, (int, float))]
+                        if nums and sum(nums) / len(nums) >= target_score:
+                            logger.info(f"Target score {target_score} reached at iteration {completed_iteration}")
+                            break
+
+                    # Early stopping
+                    if early_stopping_enabled and child_program.metrics:
+                        metric_name = self.config.early_stopping_metric
+                        if metric_name in child_program.metrics:
+                            current_score = child_program.metrics[metric_name]
+                        elif metric_name == "combined_score":
+                            current_score = safe_numeric_average(child_program.metrics)
+                        else:
+                            logger.warning(
+                                f"Early stopping metric '{metric_name}' not found; using safe numeric average"
+                            )
+                            current_score = safe_numeric_average(child_program.metrics)
+
+                        if isinstance(current_score, (int, float)):
+                            improvement = current_score - best_score
+                            if improvement >= self.config.convergence_threshold:
+                                best_score = current_score
+                                iterations_without_improvement = 0
+                            else:
+                                iterations_without_improvement += 1
+
+                            if iterations_without_improvement >= self.config.early_stopping_patience:
+                                self.early_stopping_triggered = True
+                                logger.info(
+                                    f"🛑 Early stopping at iteration {completed_iteration}: "
+                                    f"No improvement for {iterations_without_improvement} iterations "
+                                    f"(best: {best_score:.4f})"
+                                )
                                 break
 
+            except FutureTimeoutError:
+                logger.error(
+                    f"⏰ Iteration {completed_iteration} timed out after {timeout_seconds}s "
+                    f"(evaluator timeout: {self.config.evaluator.timeout}s + 30s buffer). Canceling future."
+                )
+                future.cancel()
             except Exception as e:
                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
 
             completed_iterations += 1
 
-            if next_iteration < total_iterations and not self.shutdown_event.is_set():
-                future = self._submit_iteration(next_iteration)
-                if future:
-                    pending_futures[next_iteration] = future
-                    next_iteration += 1
+            # 从岛屿队列移除
+            for isl, arr in island_pending.items():
+                if completed_iteration in arr:
+                    arr.remove(completed_iteration)
+                    break
 
+            # 继续补任务
+            for isl in range(self.num_islands):
+                if (
+                    len(island_pending[isl]) < batch_per_island
+                    and next_iteration < total_iterations
+                    and not self.shutdown_event.is_set()
+                ):
+                    fut = self._submit_iteration(next_iteration, isl)
+                    if fut:
+                        pending_futures[next_iteration] = fut
+                        island_pending[isl].append(next_iteration)
+                        next_iteration += 1
+                        break
+
+        # 收尾
         if self.shutdown_event.is_set():
             logger.info("Shutdown requested, canceling remaining evaluations...")
-            for future in pending_futures.values():
-                future.cancel()
+            for fut in pending_futures.values():
+                fut.cancel()
 
-        logger.info("Evolution completed")
+        if self.early_stopping_triggered:
+            logger.info("✅ Evolution completed - Early stopping triggered due to convergence")
+        elif self.shutdown_event.is_set():
+            logger.info("✅ Evolution completed - Shutdown requested")
+        else:
+            logger.info("✅ Evolution completed - Maximum iterations reached")
+
         return self.database.get_best_program()
 
-    def _submit_iteration(self, iteration: int) -> Optional[Future]:
-        """Submit an iteration to the process pool"""
+    def _submit_iteration(self, iteration: int, island_id: Optional[int] = None) -> Optional[Future]:
+        """Submit an iteration to the process pool, optionally pinned to a specific island"""
         try:
-            parent, inspirations = self.database.sample()
+            target_island = island_id if island_id is not None else self.database.current_island
+
+            parent, inspirations = self.database.sample_from_island(
+                island_id=target_island,
+                num_inspirations=self.config.prompt.num_top_programs
+            )
+
             db_snapshot = self._create_database_snapshot()
-            future = self.executor.submit(
+            db_snapshot["sampling_island"] = target_island
+
+            fut = self.executor.submit(
                 _run_iteration_worker,
                 iteration,
                 db_snapshot,
                 parent.id,
                 [insp.id for insp in inspirations],
             )
-            return future
+            return fut
+
+        except BrokenProcessPool as e:
+            logger.error("A child process terminated abruptly, the process pool is not usable anymore: %s", e)
+            # 尝试重建一次进程池并重试
+            try:
+                if self.executor:
+                    self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            ctx = mp.get_context("spawn")
+            self.executor = ProcessPoolExecutor(
+                max_workers=self.num_workers,
+                mp_context=ctx,
+                initializer=_worker_init,
+                initargs=(self._serialize_config(self.config), self.evaluation_file, dict(os.environ)),
+            )
+            try:
+                fut = self.executor.submit(
+                    _run_iteration_worker,
+                    iteration,
+                    self._create_database_snapshot(),
+                    parent.id,
+                    [insp.id for insp in inspirations],
+                )
+                return fut
+            except Exception as e2:
+                logger.error(f"Resubmission after pool rebuild failed: {e2}")
+                return None
         except Exception as e:
             logger.error(f"Error submitting iteration {iteration}: {e}")
             return None

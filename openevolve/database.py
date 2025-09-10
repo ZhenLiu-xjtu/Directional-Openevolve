@@ -19,7 +19,7 @@ import numpy as np
 
 from openevolve.config import DatabaseConfig
 from openevolve.utils.code_utils import calculate_edit_distance
-from openevolve.utils.metrics_utils import safe_numeric_average
+from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_score
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,9 @@ class Program:
     # Metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Prompts
+    prompts: Optional[Dict[str, Any]] = None
+
     # Artifact storage
     artifacts_json: Optional[str] = None  # JSON-serialized small artifacts
     artifact_dir: Optional[str] = None  # Path to large artifact files
@@ -105,8 +108,10 @@ class ProgramDatabase:
         # In-memory program storage
         self.programs: Dict[str, Program] = {}
 
-        # Feature grid for MAP-Elites
-        self.feature_map: Dict[str, str] = {}
+        # Per-island feature grids for MAP-Elites
+        self.island_feature_maps: List[Dict[str, str]] = [
+            {} for _ in range(config.num_islands)
+        ]
 
         # Handle both int and dict types for feature_bins
         if isinstance(config.feature_bins, int):
@@ -188,7 +193,7 @@ class ProgramDatabase:
         Args:
             program: Program to add
             iteration: Current iteration (defaults to last_iteration)
-            target_island: Specific island to add to (uses current_island if None)
+            target_island: Specific island to add to (auto-detects parent's island if None)
 
         Returns:
             Program ID
@@ -205,18 +210,49 @@ class ProgramDatabase:
         # Calculate feature coordinates for MAP-Elites
         feature_coords = self._calculate_feature_coords(program)
 
-        # Add to feature map (replacing existing if better)
+        # Determine target island
+        # If target_island is not specified and program has a parent, inherit parent's island
+        if target_island is None and program.parent_id:
+            parent = self.programs.get(program.parent_id)
+            if parent and "island" in parent.metadata:
+                # Child inherits parent's island to maintain island isolation
+                island_idx = parent.metadata["island"]
+                logger.debug(
+                    f"Program {program.id} inheriting island {island_idx} from parent {program.parent_id}"
+                )
+            else:
+                # Parent not found or has no island, use current_island
+                island_idx = self.current_island
+                if parent:
+                    logger.warning(
+                        f"Parent {program.parent_id} has no island metadata, using current_island {island_idx}"
+                    )
+                else:
+                    logger.warning(
+                        f"Parent {program.parent_id} not found, using current_island {island_idx}"
+                    )
+        elif target_island is not None:
+            # Explicit target island specified (e.g., for migrants)
+            island_idx = target_island
+        else:
+            # No parent and no target specified, use current island
+            island_idx = self.current_island
+
+        island_idx = island_idx % len(self.islands)  # Ensure valid island
+
+        # Add to island-specific feature map (replacing existing if better)
         feature_key = self._feature_coords_to_key(feature_coords)
-        should_replace = feature_key not in self.feature_map
+        island_feature_map = self.island_feature_maps[island_idx]
+        should_replace = feature_key not in island_feature_map
 
         if not should_replace:
             # Check if the existing program still exists before comparing
-            existing_program_id = self.feature_map[feature_key]
+            existing_program_id = island_feature_map[feature_key]
             if existing_program_id not in self.programs:
                 # Stale reference, replace it
                 should_replace = True
                 logger.debug(
-                    f"Replacing stale program reference {existing_program_id} in feature map"
+                    f"Replacing stale program reference {existing_program_id} in island {island_idx} feature map"
                 )
             else:
                 # Program exists, compare fitness
@@ -229,28 +265,32 @@ class ProgramDatabase:
                 for i in range(len(feature_coords))
             }
 
-            if feature_key not in self.feature_map:
-                # New cell occupation
-                logger.info("New MAP-Elites cell occupied: %s", coords_dict)
-                # Check coverage milestone
+            if feature_key not in island_feature_map:
+                # New cell occupation in this island
+                logger.info("New MAP-Elites cell occupied in island %d: %s", island_idx, coords_dict)
+                # Check coverage milestone for this island
                 total_possible_cells = self.feature_bins ** len(self.config.feature_dimensions)
-                coverage = (len(self.feature_map) + 1) / total_possible_cells
-                if coverage in [0.1, 0.25, 0.5, 0.75, 0.9]:
+                island_coverage = (len(island_feature_map) + 1) / total_possible_cells
+                if island_coverage in [0.1, 0.25, 0.5, 0.75, 0.9]:
                     logger.info(
-                        "MAP-Elites coverage reached %.1f%% (%d/%d cells)",
-                        coverage * 100,
-                        len(self.feature_map) + 1,
+                        "Island %d MAP-Elites coverage reached %.1f%% (%d/%d cells)",
+                        island_idx,
+                        island_coverage * 100,
+                        len(island_feature_map) + 1,
                         total_possible_cells,
                     )
             else:
-                # Cell replacement - existing program being replaced
-                existing_program_id = self.feature_map[feature_key]
+                # Cell replacement - existing program being replaced in this island
+                existing_program_id = island_feature_map[feature_key]
                 if existing_program_id in self.programs:
                     existing_program = self.programs[existing_program_id]
-                    new_fitness = safe_numeric_average(program.metrics)
-                    existing_fitness = safe_numeric_average(existing_program.metrics)
+                    new_fitness = get_fitness_score(program.metrics, self.config.feature_dimensions)
+                    existing_fitness = get_fitness_score(
+                        existing_program.metrics, self.config.feature_dimensions
+                    )
                     logger.info(
-                        "MAP-Elites cell improved: %s (fitness: %.3f -> %.3f)",
+                        "Island %d MAP-Elites cell improved: %s (fitness: %.3f -> %.3f)",
+                        island_idx,
                         coords_dict,
                         existing_fitness,
                         new_fitness,
@@ -261,11 +301,9 @@ class ProgramDatabase:
                         self.archive.discard(existing_program_id)
                         self.archive.add(program.id)
 
-            self.feature_map[feature_key] = program.id
+            island_feature_map[feature_key] = program.id
 
-        # Add to specific island (not random!)
-        island_idx = target_island if target_island is not None else self.current_island
-        island_idx = island_idx % len(self.islands)  # Ensure valid island
+        # Add to island
         self.islands[island_idx].add(program.id)
 
         # Track which island this program belongs to
@@ -304,9 +342,12 @@ class ProgramDatabase:
         """
         return self.programs.get(program_id)
 
-    def sample(self) -> Tuple[Program, List[Program]]:
+    def sample(self, num_inspirations: Optional[int] = None) -> Tuple[Program, List[Program]]:
         """
         Sample a program and inspirations for the next evolution step
+
+        Args:
+            num_inspirations: Number of inspiration programs to sample (defaults to 5 for backward compatibility)
 
         Returns:
             Tuple of (parent_program, inspiration_programs)
@@ -315,9 +356,100 @@ class ProgramDatabase:
         parent = self._sample_parent()
 
         # Select inspirations
-        inspirations = self._sample_inspirations(parent, n=5)
+        if num_inspirations is None:
+            num_inspirations = 5  # Default for backward compatibility
+        inspirations = self._sample_inspirations(parent, n=num_inspirations)
 
         logger.debug(f"Sampled parent {parent.id} and {len(inspirations)} inspirations")
+        return parent, inspirations
+
+    def sample_from_island(
+        self, island_id: int, num_inspirations: Optional[int] = None
+    ) -> Tuple[Program, List[Program]]:
+        """
+        Sample a program and inspirations from a specific island without modifying current_island
+
+        This method is thread-safe and doesn't modify shared state, avoiding race conditions
+        when multiple workers sample from different islands concurrently.
+
+        Args:
+            island_id: The island to sample from
+            num_inspirations: Number of inspiration programs to sample (defaults to 5)
+
+        Returns:
+            Tuple of (parent_program, inspiration_programs)
+        """
+        # Ensure valid island ID
+        island_id = island_id % len(self.islands)
+
+        # Get programs from the specific island
+        island_programs = list(self.islands[island_id])
+
+        if not island_programs:
+            # Island is empty, fall back to sampling from all programs
+            logger.debug(f"Island {island_id} is empty, sampling from all programs")
+            return self.sample(num_inspirations)
+
+        # Select parent from island programs
+        if len(island_programs) == 1:
+            parent_id = island_programs[0]
+        else:
+            # Use weighted sampling based on program scores
+            island_program_objects = [
+                self.programs[pid] for pid in island_programs
+                if pid in self.programs
+            ]
+
+            if not island_program_objects:
+                # Fallback if programs not found
+                parent_id = random.choice(island_programs)
+            else:
+                # Calculate weights based on fitness scores
+                weights = []
+                for prog in island_program_objects:
+                    fitness = get_fitness_score(prog.metrics, self.config.feature_dimensions)
+                    # Add small epsilon to avoid zero weights
+                    weights.append(max(fitness, 0.001))
+
+                # Normalize weights
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    weights = [w / total_weight for w in weights]
+                else:
+                    weights = [1.0 / len(island_program_objects)] * len(island_program_objects)
+
+                # Sample parent based on weights
+                parent = random.choices(island_program_objects, weights=weights, k=1)[0]
+                parent_id = parent.id
+
+        parent = self.programs.get(parent_id)
+        if not parent:
+            # Should not happen, but handle gracefully
+            logger.error(f"Parent program {parent_id} not found in database")
+            return self.sample(num_inspirations)
+
+        # Select inspirations from the same island
+        if num_inspirations is None:
+            num_inspirations = 5  # Default for backward compatibility
+
+        # Get other programs from the island for inspirations
+        other_programs = [pid for pid in island_programs if pid != parent_id]
+
+        if len(other_programs) < num_inspirations:
+            # Not enough programs in island, use what we have
+            inspiration_ids = other_programs
+        else:
+            # Sample inspirations
+            inspiration_ids = random.sample(other_programs, num_inspirations)
+
+        inspirations = [
+            self.programs[pid] for pid in inspiration_ids
+            if pid in self.programs
+        ]
+
+        logger.debug(
+            f"Sampled parent {parent.id} and {len(inspirations)} inspirations from island {island_id}"
+        )
         return parent, inspirations
 
     def get_best_program(self, metric: Optional[str] = None) -> Optional[Program]:
@@ -353,22 +485,15 @@ class ProgramDatabase:
             )
             if sorted_programs:
                 logger.debug(f"Found best program by metric '{metric}': {sorted_programs[0].id}")
-        elif self.programs and all("combined_score" in p.metrics for p in self.programs.values()):
-            # Sort by combined_score if it exists (preferred method)
-            sorted_programs = sorted(
-                self.programs.values(), key=lambda p: p.metrics["combined_score"], reverse=True
-            )
-            if sorted_programs:
-                logger.debug(f"Found best program by combined_score: {sorted_programs[0].id}")
         else:
-            # Sort by average of all numeric metrics as fallback
+            # Sort by fitness (excluding feature dimensions)
             sorted_programs = sorted(
                 self.programs.values(),
-                key=lambda p: safe_numeric_average(p.metrics),
+                key=lambda p: get_fitness_score(p.metrics, self.config.feature_dimensions),
                 reverse=True,
             )
             if sorted_programs:
-                logger.debug(f"Found best program by average metrics: {sorted_programs[0].id}")
+                logger.debug(f"Found best program by fitness score: {sorted_programs[0].id}")
 
         # Update the best program tracking if we found a better program
         if sorted_programs and (
@@ -436,10 +561,10 @@ class ProgramDatabase:
                 reverse=True,
             )
         else:
-            # Sort by average of all numeric metrics
+            # Sort by combined_score if available, otherwise by average of all numeric metrics
             sorted_programs = sorted(
                 candidates,
-                key=lambda p: safe_numeric_average(p.metrics),
+                key=lambda p: get_fitness_score(p.metrics, self.config.feature_dimensions),
                 reverse=True,
             )
 
@@ -477,7 +602,7 @@ class ProgramDatabase:
 
         # Save metadata
         metadata = {
-            "feature_map": self.feature_map,
+            "island_feature_maps": self.island_feature_maps,
             "islands": [list(island) for island in self.islands],
             "archive": list(self.archive),
             "best_program_id": self.best_program_id,
@@ -486,6 +611,7 @@ class ProgramDatabase:
             "current_island": self.current_island,
             "island_generations": self.island_generations,
             "last_migration_generation": self.last_migration_generation,
+            "feature_stats": self._serialize_feature_stats(),
         }
 
         with open(os.path.join(save_path, "metadata.json"), "w") as f:
@@ -511,7 +637,7 @@ class ProgramDatabase:
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
 
-            self.feature_map = metadata.get("feature_map", {})
+            self.island_feature_maps = metadata.get("island_feature_maps", [{} for _ in range(self.config.num_islands)])
             saved_islands = metadata.get("islands", [])
             self.archive = set(metadata.get("archive", []))
             self.best_program_id = metadata.get("best_program_id")
@@ -523,7 +649,12 @@ class ProgramDatabase:
             self.island_generations = metadata.get("island_generations", [0] * len(saved_islands))
             self.last_migration_generation = metadata.get("last_migration_generation", 0)
 
+            # Load feature_stats for MAP-Elites grid stability
+            self.feature_stats = self._deserialize_feature_stats(metadata.get("feature_stats", {}))
+
             logger.info(f"Loaded database metadata with last_iteration={self.last_iteration}")
+            if self.feature_stats:
+                logger.info(f"Loaded feature_stats for {len(self.feature_stats)} dimensions")
 
         # Load programs
         programs_dir = os.path.join(path, "programs")
@@ -590,13 +721,16 @@ class ProgramDatabase:
         original_archive_size = len(self.archive)
         self.archive = {pid for pid in self.archive if pid in self.programs}
 
-        # Clean up feature_map - remove missing programs
+        # Clean up island_feature_maps - remove missing programs
         feature_keys_to_remove = []
-        for key, program_id in self.feature_map.items():
-            if program_id not in self.programs:
-                feature_keys_to_remove.append(key)
-        for key in feature_keys_to_remove:
-            del self.feature_map[key]
+        for island_idx, island_map in enumerate(self.island_feature_maps):
+            island_keys_to_remove = []
+            for key, program_id in island_map.items():
+                if program_id not in self.programs:
+                    island_keys_to_remove.append(key)
+                    feature_keys_to_remove.append((island_idx, key))
+            for key in island_keys_to_remove:
+                del island_map[key]
 
         # Clean up island best programs - remove stale references
         self._cleanup_stale_island_bests()
@@ -622,7 +756,7 @@ class ProgramDatabase:
             )
 
         if feature_keys_to_remove:
-            logger.info(f"Removed {len(feature_keys_to_remove)} missing programs from feature map")
+            logger.info(f"Removed {len(feature_keys_to_remove)} missing programs from island feature maps")
 
         logger.info(f"Reconstructed islands: restored {restored_programs} programs to islands")
 
@@ -707,7 +841,8 @@ class ProgramDatabase:
                 if not program.metrics:
                     bin_idx = 0
                 else:
-                    avg_score = safe_numeric_average(program.metrics)
+                    # Use fitness score for "score" dimension (consistent with rest of system)
+                    avg_score = get_fitness_score(program.metrics, self.config.feature_dimensions)
                     # Update stats and scale
                     self._update_feature_stats("score", avg_score)
                     scaled_value = self._scale_feature_value("score", avg_score)
@@ -807,7 +942,10 @@ class ProgramDatabase:
 
     def _is_better(self, program1: Program, program2: Program) -> bool:
         """
-        Determine if program1 is better than program2
+        Determine if program1 has better FITNESS than program2
+
+        Uses fitness calculation that excludes MAP-Elites feature dimensions
+        to prevent pollution of fitness comparisons.
 
         Args:
             program1: First program
@@ -826,15 +964,11 @@ class ProgramDatabase:
         if not program1.metrics and program2.metrics:
             return False
 
-        # Check for combined_score first (this is the preferred metric)
-        if "combined_score" in program1.metrics and "combined_score" in program2.metrics:
-            return program1.metrics["combined_score"] > program2.metrics["combined_score"]
+        # Compare fitness (excluding feature dimensions)
+        fitness1 = get_fitness_score(program1.metrics, self.config.feature_dimensions)
+        fitness2 = get_fitness_score(program2.metrics, self.config.feature_dimensions)
 
-        # Fallback to average of all numeric metrics
-        avg1 = safe_numeric_average(program1.metrics)
-        avg2 = safe_numeric_average(program2.metrics)
-
-        return avg1 > avg2
+        return fitness1 > fitness2
 
     def _update_archive(self, program: Program) -> None:
         """
@@ -871,7 +1005,8 @@ class ProgramDatabase:
         # Find worst program among valid programs
         if valid_archive_programs:
             worst_program = min(
-                valid_archive_programs, key=lambda p: safe_numeric_average(p.metrics)
+                valid_archive_programs,
+                key=lambda p: get_fitness_score(p.metrics, self.config.feature_dimensions),
             )
 
             # Replace if new program is better
@@ -1273,10 +1408,10 @@ class ProgramDatabase:
         # Get programs sorted by fitness (worst first)
         all_programs = list(self.programs.values())
 
-        # Sort by average metric (worst first)
+        # Sort by combined_score if available, otherwise by average metric (worst first)
         sorted_programs = sorted(
             all_programs,
-            key=lambda p: safe_numeric_average(p.metrics),
+            key=lambda p: get_fitness_score(p.metrics, self.config.feature_dimensions),
         )
 
         # Remove worst programs, but never remove the best program or excluded program
@@ -1309,13 +1444,14 @@ class ProgramDatabase:
             if program_id in self.programs:
                 del self.programs[program_id]
 
-            # Remove from feature map
-            keys_to_remove = []
-            for key, pid in self.feature_map.items():
-                if pid == program_id:
-                    keys_to_remove.append(key)
-            for key in keys_to_remove:
-                del self.feature_map[key]
+            # Remove from island feature maps
+            for island_idx, island_map in enumerate(self.island_feature_maps):
+                keys_to_remove = []
+                for key, pid in island_map.items():
+                    if pid == program_id:
+                        keys_to_remove.append(key)
+                for key in keys_to_remove:
+                    del island_map[key]
 
             # Remove from islands
             for island in self.islands:
@@ -1376,7 +1512,7 @@ class ProgramDatabase:
 
             # Sort by fitness (using combined_score or average metrics)
             island_programs.sort(
-                key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
+                key=lambda p: get_fitness_score(p.metrics, self.config.feature_dimensions),
                 reverse=True,
             )
 
@@ -1409,9 +1545,10 @@ class ProgramDatabase:
                     continue
 
                 for target_island in target_islands:
-                    # Create a copy for migration (to avoid removing from source)
+                    # Create a copy for migration with simple new UUID
+                    import uuid
                     migrant_copy = Program(
-                        id=f"{migrant.id}_migrant_{target_island}",
+                        id=str(uuid.uuid4()),
                         code=migrant.code,
                         language=migrant.language,
                         parent_id=migrant.id,
@@ -1547,7 +1684,7 @@ class ProgramDatabase:
 
             if island_programs:
                 scores = [
-                    p.metrics.get("combined_score", safe_numeric_average(p.metrics))
+                    get_fitness_score(p.metrics, self.config.feature_dimensions)
                     for p in island_programs
                 ]
 
@@ -1814,6 +1951,66 @@ class ProgramDatabase:
 
         scaled = (value - min_val) / (max_val - min_val)
         return min(1.0, max(0.0, scaled))
+
+    def _serialize_feature_stats(self) -> Dict[str, Any]:
+        """
+        Serialize feature_stats for JSON storage
+
+        Returns:
+            Dictionary that can be JSON-serialized
+        """
+        serialized = {}
+        for feature_name, stats in self.feature_stats.items():
+            # Convert to JSON-serializable format
+            serialized_stats = {}
+            for key, value in stats.items():
+                if key == "values":
+                    # Limit size to prevent excessive memory usage
+                    # Keep only the most recent 100 values for percentile calculations
+                    if isinstance(value, list) and len(value) > 100:
+                        serialized_stats[key] = value[-100:]
+                    else:
+                        serialized_stats[key] = value
+                else:
+                    # Convert numpy types to Python native types
+                    if hasattr(value, "item"):  # numpy scalar
+                        serialized_stats[key] = value.item()
+                    else:
+                        serialized_stats[key] = value
+            serialized[feature_name] = serialized_stats
+        return serialized
+
+    def _deserialize_feature_stats(
+        self, stats_dict: Dict[str, Any]
+    ) -> Dict[str, Dict[str, Union[float, List[float]]]]:
+        """
+        Deserialize feature_stats from loaded JSON
+
+        Args:
+            stats_dict: Dictionary loaded from JSON
+
+        Returns:
+            Properly formatted feature_stats dictionary
+        """
+        if not stats_dict:
+            return {}
+
+        deserialized = {}
+        for feature_name, stats in stats_dict.items():
+            if isinstance(stats, dict):
+                # Ensure proper structure and types
+                deserialized_stats = {
+                    "min": float(stats.get("min", 0.0)),
+                    "max": float(stats.get("max", 1.0)),
+                    "values": list(stats.get("values", [])),
+                }
+                deserialized[feature_name] = deserialized_stats
+            else:
+                logger.warning(
+                    f"Skipping malformed feature_stats entry for '{feature_name}': {stats}"
+                )
+
+        return deserialized
 
     def log_island_status(self) -> None:
         """Log current status of all islands"""
