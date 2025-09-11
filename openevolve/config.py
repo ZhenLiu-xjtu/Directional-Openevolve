@@ -283,6 +283,7 @@ class EvaluatorConfig:
     train_subset: Optional[int] = None         # e.g. 2000 samples
     eval_subset: Optional[int] = None          # e.g. 2000 samples
     batch_size: Optional[int] = None           # override evaluator default
+    ai_mb_threshold: int = 8
 
 
 @dataclass

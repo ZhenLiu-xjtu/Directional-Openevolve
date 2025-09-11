@@ -151,6 +151,7 @@ direction_feedback:
   stagnation_k: 6
   epsilon: 0.01
   max_df_lines: 12
+  ai_mb_threshold: 32
   allowed_ops:
     - "elementwise multiply + sum ( (a * b).sum() )"
     - "tile_size ∈ {128,256} on input-dim"
@@ -163,9 +164,9 @@ direction_feedback:
     - "torch.mm / torch.mv / torch.matmul / @ / einsum / bmm"
     - "innermost loop over B (batch dimension)"
     - "write through a view (e.g., out_b = out[b]; out_b[j] = ...)"
+  weights: { perf: 1.0, latency: 0.5, params: 0.3 }
   # --- 新增项（可选） ---
   metric_keys: ["acc", "latency_ms", "params"]
-  weights: { perf: 1.0, latency: 0.5, params: 0.3 }
   resource_tolerances: { params_pct: 0.10, flops_pct: 0.20, mem_pct: 0.15 }
   stagnation: { k: 5, slope_eps: 1.0e-3 }
   diversify_penalty_cos: 0.92

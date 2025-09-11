@@ -62,8 +62,8 @@ class PromptSampler:
             user_template = self._apply_template_variations(user_template)
 
         improvement_areas = self._render_improvement_areas(program_metrics, previous_programs)
-        direction_guidance = direction_guidance or "Tend towards lower FLOPs; Attempt to tile/unroll and constrain the number of parameters"
-
+        # direction_guidance = direction_guidance or "Tend towards lower FLOPs; Attempt to tile/unroll and constrain the number of parameters"
+        direction_guidance = direction_guidance or ""
         # print("direction_guidance:",direction_guidance)
         # print("self.config:",self.config)
         # print(",self.direction_cfg:",self.direction_cfg)
@@ -241,7 +241,7 @@ class PromptSampler:
         except Exception as _e:
             logger.debug("direction_feedback formatting skipped: %s", _e)
 
-        merged_dir = explicit_dir if explicit_dir else auto_dir
+        merged_dir = auto_dir if auto_dir else explicit_dir
 
         cfg_dir: Dict[str, Any] = {}
         # print("self.direction_cfg:",self.direction_cfg)
@@ -270,7 +270,7 @@ class PromptSampler:
         lines: List[str] = []
         if merged_dir:
             lines.append(merged_dir.strip())
-        lines.append("-Objective: Prioritize reducing the number of multiplications (MACs/FLOPs) and inference latency")
+        # lines.append("-Objective: Prioritize reducing the number of multiplications (MACs/FLOPs) and inference latency")
 
         allowed_ops = cfg_dir.get("allowed_ops", []) or []
         forbidden = cfg_dir.get("forbidden_patterns", []) or []
@@ -358,9 +358,96 @@ class PromptSampler:
 
 
     # ======= Anchor-aware DF: helpers (NEW) =======
+    # === Linear-DDO helpers: robust normalization / Pareto / crowding / AI regime ===
+
+    def _obj_vec(self, prog: dict) -> List[float]:
+        """3-obj (all 'smaller is better'): [-acc, latency_ms, params]"""
+        return [
+            -float(self._m(prog, "acc", 0.0)),
+            float(self._m(prog, "latency_ms", 0.0)),
+            float(self._m(prog, "params", 0.0)),
+        ]
+
+    def _robust_norm_stats(self, pool: List[dict]):
+        cols = list(zip(*[self._obj_vec(p) for p in pool])) if pool else [[], [], []]
+        stats = []
+        for col in cols:
+            if not col:
+                stats.append((0.0, 1.0, 0.0))  # median, IQR, min
+                continue
+            xs = sorted(col);
+            n = len(xs)
+            med = xs[n // 2]
+            q1, q3 = xs[n // 4], xs[(3 * n) // 4]
+            iqr = max(1e-9, q3 - q1)
+            mn = xs[0]
+            stats.append((med, iqr, mn))
+        return stats  # list of (median, iqr, min)
+
+    def _normalize_obj(self, f: List[float], stats) -> List[float]:
+        out = []
+        for j, val in enumerate(f):
+            med, iqr, mn = stats[j]
+            z = (val - med) / iqr
+            out.append(z - min(0.0, (mn - med) / iqr))  # shift so min≥0
+        return out
+
+    def _pareto_frontier(self, pool: List[dict]) -> List[dict]:
+        """Simple non-dominated filter on raw f (not normalized)"""
+        Fs = [self._obj_vec(p) for p in pool]
+        nd = []
+        for i, Fi in enumerate(Fs):
+            dominated = False
+            for j, Fj in enumerate(Fs):
+                if i == j: continue
+                if all(Fj[k] <= Fi[k] for k in range(3)) and any(Fj[k] < Fi[k] for k in range(3)):
+                    dominated = True;
+                    break
+            if not dominated:
+                nd.append(pool[i])
+        return nd
+
+    def _crowding_distance(self, frontier: List[dict], stats) -> Dict[str, float]:
+        """NSGA-II style crowding distance on normalized f-hat"""
+        if not frontier: return {}
+        Fh = [self._normalize_obj(self._obj_vec(p), stats) for p in frontier]
+        m, n = len(Fh[0]), len(frontier)
+        dist = [0.0] * n
+        for j in range(m):
+            idx = sorted(range(n), key=lambda i: Fh[i][j])
+            dist[idx[0]] = dist[idx[-1]] = float('inf')
+            for t in range(1, n - 1):
+                dist[idx[t]] += Fh[idx[t + 1]][j] - Fh[idx[t - 1]][j]
+        return {frontier[i].get("id", str(i)): dist[i] for i in range(n)}
+
+    def _ai_proxy(self, prog: dict) -> float:
+        """Cheap arithmetic-intensity proxy for Linear: MACs per parameter."""
+        macs = float(self._m(prog, "flops", 0.0))
+        params = max(1e-9, float(self._m(prog, "params", 0.0)))
+        return macs / params
+
+    def _ai_regime(self, prog: dict, cfg: dict) -> str:
+        """Classify as bandwidth / compute / balanced via AI proxy against a threshold."""
+        ai = self._ai_proxy(prog)
+        thr = float(cfg.get("ai_mb_threshold", 32.0))  # configurable, device-dependent
+        if ai < 0.75 * thr: return "bandwidth"
+        if ai > 1.25 * thr: return "compute"
+        return "balanced"
+
+    def _regime_aware_weights(self, base_w: dict, regime: str) -> dict:
+        """Reweight latency/params according to regime, keep perf as anchor."""
+        w = {"perf": 1.0, "latency": 0.5, "params": 0.3}
+        w.update({k: float(v) for k, v in (base_w or {}).items()})
+        if regime == "bandwidth":
+            w["params"] *= 1.6
+            w["latency"] *= 0.9
+        elif regime == "compute":
+            w["latency"] *= 1.6
+            w["params"] *= 0.9
+        return w
 
     def _aa_cfg(self) -> dict:
-        """Anchor-aware 配置的默认值 + 兼容 direction_cfg 里的老键"""
+        """Anchor-aware 配置（含 Linear-DDO 的 AI 阈值），兼容老键"""
         cfg_dir = {}
         if self.direction_cfg is not None:
             if isinstance(self.direction_cfg, dict):
@@ -372,7 +459,6 @@ class PromptSampler:
                 except Exception:
                     cfg_dir = getattr(self.direction_cfg, "__dict__", {}) or {}
 
-        # 兼容老键：allowed_ops/forbidden_patterns
         actions = cfg_dir.get("actions", {})
         if not actions and (("allowed_ops" in cfg_dir) or ("forbidden_patterns" in cfg_dir)):
             actions = {
@@ -384,10 +470,13 @@ class PromptSampler:
         return {
             "metric_keys": cfg_dir.get("metric_keys", ["acc", "latency_ms", "params"]),
             "weights": cfg_dir.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3}),
-            "resource_tolerances": cfg_dir.get("resource_tolerances", {"params_pct": 0.10, "flops_pct": 0.20, "mem_pct": 0.15}),
+            "resource_tolerances": cfg_dir.get("resource_tolerances",
+                                               {"params_pct": 0.10, "flops_pct": 0.20, "mem_pct": 0.15}),
             "stagnation": cfg_dir.get("stagnation", {"k": 5, "slope_eps": 1e-3}),
             "diversify_penalty_cos": cfg_dir.get("diversify_penalty_cos", 0.92),
             "actions": actions,
+            # Linear-DDO extra:
+            "ai_mb_threshold": cfg_dir.get("ai_mb_threshold", 32.0),
         }
 
     def _m(self, prog: dict, key: str, default=0.0):
@@ -496,54 +585,96 @@ class PromptSampler:
         }
 
     def _direction_and_step(self, cur: dict, anc: dict, weights: dict, history: list, k: int):
-        cur_acc = self._m(cur, "acc", 0.0); tar_acc = self._m(anc, "acc", cur_acc)
-        cur_lat = self._m(cur, "latency_ms", 0.0); tar_lat = self._m(anc, "latency_ms", cur_lat)
-        cur_par = self._m(cur, "params", 0.0); tar_par = self._m(anc, "params", cur_par)
+        pool = (history or []) + [cur, anc]
+        stats = self._robust_norm_stats(pool)
+        f_cur = self._normalize_obj(self._obj_vec(cur), stats)
+        f_tar = self._normalize_obj(self._obj_vec(anc), stats)
 
-        dv = [
-            float(weights.get("perf", 1.0))    * (tar_acc - cur_acc),
-            -float(weights.get("latency", 0.5)) * (tar_lat - cur_lat),
-            -float(weights.get("params", 0.3))  * (tar_par - cur_par),
-        ]
+        dv = [f_tar[j] - f_cur[j] for j in range(3)]
+        norm = (sum(x * x for x in dv) ** 0.5) or 1.0
+        dv = [x / norm for x in dv]
 
+        # Trust-region via recent unit gains
         step = 0.3
         if history and len(history) >= 2:
             tail = history[-min(k, len(history)):]
-            gain = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
-            d_params = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
-            step = float(max(0.1, min(1.0, (gain / (abs(d_params) + 1e-9)))))
+            dacc = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
+            dpar = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
+            dlat = self._m(tail[-1], "latency_ms", 0.0) - self._m(tail[0], "latency_ms", 0.0)
+            g = 0.6 * (dacc / (abs(dpar) + 1e-9)) + 0.4 * (dacc / (abs(dlat) + 1e-9))
+            step = max(0.1, min(1.0, 0.5 * g + 0.3))
 
-        return dv, step, {"acc_target": tar_acc, "latency_target": tar_lat, "params_target": tar_par}
+        edit_budget = max(1, min(4, int(round(1 + 3 * step))))
+        targets = {
+            "acc_target": max(0.0, self._m(cur, "acc", 0.0) - dv[0] * 0.02),  # dv[0] is -acc direction
+            "latency_target": max(0.0, self._m(cur, "latency_ms", 0.0) + dv[1] * 5.0),
+            "params_target": max(0.0, self._m(cur, "params", 0.0) + dv[2] * 0.05 * self._m(cur, "params", 0.0)),
+            "edit_budget": edit_budget,
+        }
+        return dv, step, targets
 
     def _render_anchor_text(self, cur: dict, anchor: dict, dv: list, step: float, actions: dict, max_params_pct: float):
         cur_acc = self._m(cur, "acc", 0.0)
         tar_acc = self._m(anchor, "acc", cur_acc)
         cur_par = self._m(cur, "params", 0.0)
-        budget = cur_par * (1.0 + float(max_params_pct))
+        budget = min(cur_par * (1.0 + float(max_params_pct)), self._m(anchor, "params", cur_par))
 
+        regime = self._ai_regime(cur, self._aa_cfg())
         prefer_ops = ", ".join(actions.get("prefer_ops", [])) if actions else ""
-        avoid_ops  = ", ".join(actions.get("avoid_ops", [])) if actions else ""
-
-        latency_proj = max(0.0, self._m(cur, "latency_ms", 0.0) - abs(float(dv[1])))
+        avoid_ops = ", ".join(actions.get("avoid_ops", [])) if actions else ""
 
         lines = [
-            "## Directional Guidance",
-            f"[Anchor-aware] Raise acc {cur_acc:.4f} → ≥ {tar_acc:.4f}; keep params ≤ {budget:.0f}.",
-            f"Projected latency target: ≤ {latency_proj:.1f} ms.",
+            "## Directional Guidance (Linear-DDO)",
+            f"Regime: {regime}. Aim: Acc↑, Lat↓, Params↓.",
+            f"Target: acc {cur_acc:.4f} → ≥ {tar_acc:.4f}; params ≤ {budget:.0f}.",
+            f"Trust-region step: {step:.2f} → edit budget: {max(1, min(4, int(round(1 + 3 * step))))}.",
         ]
-        if prefer_ops:
-            lines.append("**Preferred ops/knobs:** " + prefer_ops)
-        if avoid_ops:
-            lines.append("**Avoid patterns:** " + avoid_ops)
-        lines.append(f"**Normalized step size:** {step:.2f}")
+        if prefer_ops: lines.append("**Preferred ops/knobs:** " + prefer_ops)
+        if avoid_ops:  lines.append("**Avoid patterns:** " + avoid_ops)
         return "\n".join(lines)
 
     def _select_anchor(self, cur: dict, history: list, prev: list, top: list, cfg: dict):
-        candidates = (top or []) + (prev or [])
-        same = self._pick_same_resource_anchor(cur, candidates, cfg["resource_tolerances"])
-        if same:
-            return same
-        hetero = self._pick_hetero_anchor(cur, candidates)
-        if hetero:
-            return hetero
-        return self._hallucinated_anchor(cur, history, cfg["stagnation"]["k"], cfg["actions"].get("max_param_increase_pct", 0.05))
+        pool = [p for p in ((top or []) + (prev or [])) if p]
+        if not pool:
+            return self._hallucinated_anchor(
+                cur, history, cfg["stagnation"]["k"],
+                cfg["actions"].get("max_param_increase_pct", 0.05)
+            )
+
+        # 1) Pareto frontier on raw objectives
+        frontier = self._pareto_frontier(pool)
+        stats = self._robust_norm_stats(pool + [cur])
+
+        # 2) Ideal point z* in normalized space
+        Fh = [self._normalize_obj(self._obj_vec(p), stats) for p in frontier]
+        Z = list(map(min, zip(*Fh))) if Fh else [0.0, 0.0, 0.0]
+
+        # 3) Regime-aware weights
+        regime = self._ai_regime(cur, cfg)
+        base_w = cfg.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3})
+        W = self._regime_aware_weights(base_w, regime)
+
+        crowd = self._crowding_distance(frontier, stats)
+
+        # AI “向分界靠近”奖励（更接近 Mb 的候选更好）
+        Mb = float(cfg.get("ai_mb_threshold", 32.0))
+        ai_cur = self._ai_proxy(cur)
+
+        best, bestU = None, -1e18
+        for p in frontier:
+            pid = p.get("id", "p")
+            fhat = self._normalize_obj(self._obj_vec(p), stats)
+            tche = max(W["perf"] * abs(fhat[0] - Z[0]),
+                       W["latency"] * abs(fhat[1] - Z[1]),
+                       W["params"] * abs(fhat[2] - Z[2]))
+            ai_p = self._ai_proxy(p)
+            ai_term = (abs(ai_cur - Mb) - abs(ai_p - Mb))  # closer-to-Mb is rewarded
+
+            U = -tche + 0.2 * crowd.get(pid, 0.0) + 0.1 * ai_term
+            if U > bestU:
+                bestU, best = U, p
+
+        return best or self._hallucinated_anchor(
+            cur, history, cfg["stagnation"]["k"],
+            cfg["actions"].get("max_param_increase_pct", 0.05)
+        )
