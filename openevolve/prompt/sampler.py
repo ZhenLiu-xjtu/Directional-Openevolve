@@ -235,14 +235,20 @@ class PromptSampler:
         auto_dir = ""
         try:
             if parent_program_dict:
-                auto_dir = self._format_direction_feedback(parent_program_dict).strip()
+                auto_dir = self._format_direction_feedback(
+                    parent_program_dict,
+                    cur_metrics_override=program_metrics
+                ).strip()
                 if auto_dir:
                     logger.info("DF preview(auto): %s", auto_dir.splitlines()[:3])
+
         except Exception as _e:
             logger.debug("direction_feedback formatting skipped: %s", _e)
 
+        # print("auto_dir:",auto_dir)
+        # print("explicit_dir:",explicit_dir)
         merged_dir = auto_dir if auto_dir else explicit_dir
-
+        # print("merged_dir:",merged_dir)
         cfg_dir: Dict[str, Any] = {}
         # print("self.direction_cfg:",self.direction_cfg)
         if self.direction_cfg is not None:
@@ -255,15 +261,17 @@ class PromptSampler:
                     cfg_dir = getattr(self.direction_cfg, "__dict__", {}) or {}
         # print("cfg_dir:",cfg_dir)
         enabled = bool(cfg_dir.get("enabled", False))
+        # print("enabled:",enabled)
         freq = int(cfg_dir.get("frequency", 1) or 1)
         max_lines = int(cfg_dir.get("max_df_lines", 12))
 
         logger.info("[DIRFB] enabled=%s freq=%s explicit_len=%d auto_len=%d (sampler=%s)",
                     enabled, freq, len(explicit_dir), len(auto_dir), __file__)
-
+        # print("[DIRFB] enabled=%s freq=%s explicit_len=%d auto_len=%d (sampler=%s)",
+        #             enabled, freq, len(explicit_dir), len(auto_dir), __file__)
         should_inject = bool(enabled and (int(evolution_round) % freq == 0))
         # print("enabled:",enabled,evolution_round,freq,should_inject)
-        #  False 1 1 False
+        #  enabled: True 1 1 True
         if not should_inject:
             return ""
 
@@ -284,7 +292,9 @@ class PromptSampler:
             text = "## Directional Guidance\n" + text
         return text
 
-    def _format_direction_feedback(self, program: Dict[str, Any]) -> str:
+    def _format_direction_feedback(self, program: Dict[str, Any],
+                                   cur_metrics_override: Optional[Dict[str, Any]] = None) -> str:
+
         """
         Anchor-aware Directional Feedback:
         1) 选锚点：同资源 > 异源 > 幻想
@@ -292,28 +302,79 @@ class PromptSampler:
         3) 生成可操作的自然语言 DF
         4) 任何缺失 → 回退到旧的 slope/stagnation 提示
         """
-        try:
-            cfg = self._aa_cfg()
-            # 这些上下文来自 build_prompt() 的入参；此处在 build_prompt() 里保存一下即可
-            prev = getattr(self, "_ctx_prev", []) or []
-            top = getattr(self, "_ctx_top", []) or []
-            hist = prev  # 简化：以 previous_programs 近 k 轮作为岛内历史
+        cfg = self._aa_cfg()
+        prev = getattr(self, "_ctx_prev", []) or []
+        top = getattr(self, "_ctx_top", []) or []
+        hist = prev
 
-            cur = program or {}
-            anchor = self._select_anchor(cur, hist, prev, top, cfg)
+        # 若 parent/prev/top 缺关键指标，用当前 program_metrics 做兜底
+        prog = dict(program or {})
+        if cur_metrics_override:
+            pm = (prog.get("metrics") or {})
+            has_core = any(
+                k in pm for k in ("acc", "accuracy", "top1", "latency_ms", "infer_time_s", "params", "macs", "flops"))
+            if not has_core:
+                merged = dict(pm)
+                merged.update(cur_metrics_override or {})
+                prog["metrics"] = merged
+        program = prog
+
+        # Anchor object we will use
+        anchor = None
+        anchor_id = None
+
+        try:
+            # 为了兼容不同实现，尝试若干常见参数名
+            suggest = None
+            am = self._anchor_manager
+            # 不同仓库可能方法名不同：suggest(...) 或 select_anchor(...)
+            if hasattr(am, "suggest"):
+                try:
+                    suggest = am.suggest(current=program, previous=prev, top=top)
+                except TypeError:
+                    # 退而求其次的签名
+                    suggest = am.suggest(program, prev, top)
+            elif hasattr(am, "select_anchor"):
+                suggest = am.select_anchor(program, prev, top)
+
+            if isinstance(suggest, dict):
+                # 取出锚点实体与 id
+                anchor = suggest.get("anchor") or suggest.get("program") or suggest.get("candidate")
+                anchor_id = suggest.get("anchor_id") or suggest.get("id") or \
+                            (anchor.get("id") if isinstance(anchor, dict) else None)
+            elif isinstance(suggest, (list, tuple)) and suggest:
+                anchor = suggest[0]
+                anchor_id = getattr(anchor, "id", None) or (anchor.get("id") if isinstance(anchor, dict) else None)
+
+        except Exception as e:
+            logger.debug("AnchorManager.suggest failed; fallback to local anchor selector: %s", e)
+
+            # ========== 2) Local fallback (same→hetero→hallucinated) ==========
+        try:
+            if anchor is None:
+                anchor = self._select_anchor(program, hist, prev, top, cfg)
+                anchor_id = (anchor.get("id") if isinstance(anchor, dict) else None)
+        except Exception as e:
+            logger.debug("Local anchor selection failed: %s", e)
+
+            # ========== 3) Direction + step + render ==========
+        try:
             if anchor:
-                dv, step, targets = self._direction_and_step(cur, anchor, cfg["weights"], hist, cfg["stagnation"]["k"])
+                dv, step, targets = self._direction_and_step(program, anchor, cfg["weights"], hist,
+                                                             cfg["stagnation"]["k"])
                 text = self._render_anchor_text(
-                    cur, anchor, dv, step,
+                    program, anchor, dv, step,
                     actions=cfg.get("actions", {}),
                     max_params_pct=cfg.get("actions", {}).get("max_param_increase_pct", 0.05),
                 )
+                # 可选打印锚点 id
+                if cfg.get("print_anchor_id", False) and anchor_id:
+                    text = text + f"\n[anchor_id: {anchor_id}]"
                 return text
+        except Exception as e:
+            logger.debug("Direction rendering failed, fallback to legacy DF: %s", e)
 
-        except Exception as _e:
-            logger.debug("anchor-aware DF failed, fallback to legacy: %s", _e)
-
-        # ---------- 安全回退：使用你现有的“坡度/平台期”提示 ----------
+            # ========== 4) Legacy fallback ==========
         md = (program or {}).get("metadata", {}) or {}
         slope = md.get("slope_on_baseline", None)
         slope_avg = md.get("slope_mean_k", None)
@@ -617,7 +678,10 @@ class PromptSampler:
         cur_acc = self._m(cur, "acc", 0.0)
         tar_acc = self._m(anchor, "acc", cur_acc)
         cur_par = self._m(cur, "params", 0.0)
-        budget = min(cur_par * (1.0 + float(max_params_pct)), self._m(anchor, "params", cur_par))
+        if cur_par <= 0:
+            cur_par = self._m(anchor, "params", 0.0)
+        anch_par = self._m(anchor, "params", 0.0) or cur_par
+        budget = max(1.0, min(cur_par * (1.0 + float(max_params_pct)), anch_par))
 
         regime = self._ai_regime(cur, self._aa_cfg())
         prefer_ops = ", ".join(actions.get("prefer_ops", [])) if actions else ""
@@ -633,8 +697,16 @@ class PromptSampler:
         if avoid_ops:  lines.append("**Avoid patterns:** " + avoid_ops)
         return "\n".join(lines)
 
+    def _has_core_metrics(self, prog: dict) -> bool:
+        m = (prog or {}).get("metrics", {}) or {}
+        return any(k in m for k in ("acc", "accuracy", "top1", "latency_ms", "infer_time_s", "params", "macs", "flops"))
+
     def _select_anchor(self, cur: dict, history: list, prev: list, top: list, cfg: dict):
-        pool = [p for p in ((top or []) + (prev or [])) if p]
+        pool = [p for p in ((top or []) + (prev or [])) if p and self._has_core_metrics(p)]
+        # 若候选仍为空，至少把当前点塞进去，避免全 0
+        if not pool and self._has_core_metrics(cur):
+            pool = [cur]
+
         if not pool:
             return self._hallucinated_anchor(
                 cur, history, cfg["stagnation"]["k"],

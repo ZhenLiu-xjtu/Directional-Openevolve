@@ -217,15 +217,23 @@ def _run_iteration_worker(
         )
         num_top = _worker_config.prompt.num_top_programs
         num_div = _worker_config.prompt.num_diverse_programs
-        programs_for_prompt = island_programs[: num_top + num_div]
-        best_programs_only = island_programs[: num_top]
+        # 用“Top”（按分数）做展示，但用“最近 K 个”（按时间）做 DF 的历史
+        programs_for_prompt = island_programs[: num_top + num_div]  # 仍用于展示
+        best_programs_only = island_programs[: num_top]  # 仍用于展示
 
-        # 组装 prompt
+        # —— 关键：按时间顺序的最近 K 条历史（而不是 top）
+        island_ids = db_snapshot.get("islands", [[]])[parent_island]
+        recent_all = [programs[pid] for pid in island_ids if pid in programs]
+        # 至少要有 2 条避免斜率为 0；默认取 DF 配里 k_window（没有就 8）
+        K = getattr(getattr(_worker_config, "direction_feedback", {}), "k_window", 8) or 8
+        recent_tail = recent_all[-max(2, K):]
+        previous_for_df = [p.to_dict() for p in recent_tail]
+
         prompt = _worker_prompt_sampler.build_prompt(
             current_program=parent.code,
             parent_program=parent.code,
             program_metrics=parent.metrics,
-            previous_programs=[p.to_dict() for p in best_programs_only],
+            previous_programs=previous_for_df,  # ✅ 用时间窗历史
             top_programs=[p.to_dict() for p in programs_for_prompt],
             inspirations=[p.to_dict() for p in inspirations],
             language=_worker_config.language,
@@ -233,6 +241,9 @@ def _run_iteration_worker(
             diff_based_evolution=_worker_config.diff_based_evolution,
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
+
+            # ✅ 显式传入 parent，避免用 previous_programs[-1] 兜底
+            parent_program_dict=parent.to_dict(),
         )
 
         iteration_start = time.time()

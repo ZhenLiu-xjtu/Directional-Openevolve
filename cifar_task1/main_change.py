@@ -241,7 +241,6 @@ def load_cifar10_data(data_dir, max_train=None, max_test=None, seed=42):
 #             out += self.b
 #         return out
 
-
 class EvolvedLoopLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
@@ -264,18 +263,54 @@ class EvolvedLoopLinear(nn.Module):
         else:
             B = x.size(0)
 
-        # Optimize tensor operations by pre-expanding weight matrix
-        # This improves memory access patterns and reduces computation time
-        x_expanded = x.unsqueeze(1)  # [B, 1, in_features]
-        weight = self.weight  # [out_features, in_features]
+        out = x.new_zeros(B, self.out_features)
 
-        # Multiply and sum along input dimension
-        out = (x_expanded * weight).sum(dim=2)  # [B, out_features]
-
-        # Add bias if present using simpler broadcasting
-        if self.bias is not None:
-            out += self.bias
+        for b in range(B):
+            xb = x[b]  # [in_features]
+            # Process output features in tiles of size 16
+            for j_start in range(0, self.out_features, 16):
+                # Process 16 output features at once
+                tile_end = min(j_start + 16, self.out_features)
+                for j in range(j_start, tile_end):
+                    acc = (xb * self.weight[j]).sum()
+                    if self.bias is not None:
+                        acc = acc + self.bias[j]
+                    out[b, j] = acc
         return out
+# class EvolvedLoopLinear(nn.Module):
+#     def __init__(self, in_features: int, out_features: int, bias: bool = True):
+#         super().__init__()
+#         self.in_features = int(in_features)
+#         self.out_features = int(out_features)
+#
+#         self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+#         self.bias = nn.Parameter(torch.zeros(self.out_features)) if bias else None
+#
+#         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+#         if self.bias is not None:
+#             bound = (self.in_features) ** -0.5
+#             nn.init.uniform_(self.bias, -bound, bound)
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # x: [B, 3, 32, 32] or [B, in]
+#         if x.dim() == 4:
+#             B = x.size(0)
+#             x = x.reshape(B, -1)
+#         else:
+#             B = x.size(0)
+#
+#         # Optimize tensor operations by pre-expanding weight matrix
+#         # This improves memory access patterns and reduces computation time
+#         x_expanded = x.unsqueeze(1)  # [B, 1, in_features]
+#         weight = self.weight  # [out_features, in_features]
+#
+#         # Multiply and sum along input dimension
+#         out = (x_expanded * weight).sum(dim=2)  # [B, out_features]
+#
+#         # Add bias if present using simpler broadcasting
+#         if self.bias is not None:
+#             out += self.bias
+#         return out
 
 
 # class EvolvedLoopLinear(nn.Module):
