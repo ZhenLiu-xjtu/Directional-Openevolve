@@ -41,6 +41,8 @@ Current Program Information
 # Directional Feedback
 {direction_feedback}
 
+
+
 # Current Program
 ```{language}
 {current_program}
@@ -48,14 +50,28 @@ Current Program Information
 
 # Task
 Suggest improvements to the program that will lead to better performance on the specified metrics.
+[Accounting rule for MACs]
+- The evaluator estimates MACs from declared hyperparameters in `build_model` metadata. Pure loop reordering/tiling/unrolling WILL NOT reduce MACs; they only affect latency.
+- To reduce MACs, prefer structure changes that can be expressed via hyperparameters (e.g., low-rank factorization rank `r`, group count `g`, sparsity ratio).
+- Whenever you apply a structural change, also update the returned metadata hyperparameters accordingly so the MACs estimator captures it.
+
+[Objective shaping]
+- Primary: increase Top-1 accuracy.
+- Secondary (strong): reduce MACs as computed by the evaluator; then reduce latency and parameters.
 
 You MUST use the exact SEARCH/REPLACE diff format shown below to indicate changes:
 
 <<<<<<< SEARCH
-# Original code to find and replace (must match exactly)
+- Do NOT introduce new Python identifiers that are not present in the current program context
+  (e.g., keep variable names like `x`, `labels`, etc. unchanged). In particular, do not invent
+  variables such as `xb` if they do not already exist.
+- Do NOT change function/class signatures (keep `forward(self, x)` and return types the same).
 =======
-# New replacement code
+- Keep the external I/O contract identical (input/output tensor shapes and value ranges unchanged).
+- You MAY introduce new local variables, module attributes (e.g., extra parameters/buffers), and small helper functions inside this file if needed for structure changes (e.g., low-rank factors, group partitions, sparsity masks).
+- Do NOT change public entry points: keep `forward(self, x)` and the returned tensor shape the same.
 >>>>>>> REPLACE
+
 
 Example of valid diff format:
 <<<<<<< SEARCH
@@ -98,7 +114,50 @@ FULL_REWRITE_USER_TEMPLATE = """# Current Program Information
 # Task
 Rewrite the program to improve its performance on the specified metrics.
 Provide the complete new program code.
+[Invariants — MUST KEEP]
+- Export a function: build_model() -> (nn.Module, meta: dict)
+- Keep forward(self, x) input/output SHAPES and ranges unchanged.
+- Return meta["hyperparams"] with keys:
+  in_dim, num_classes, hidden_dim (0 if single stage),
+  lowrank_rank, groups, sparsity
+- Do NOT change dataset/training/eval pipeline.
 
+[You MAY rewrite freely]
+- You may add/remove local variables, module attributes (parameters/buffers), and helpers.
+- You may switch structure: low-rank factorization, group linear, sparsify, 2-layer MLP, or others.
+- You MAY use matmul/mm/einsum/F.linear if available (runtime switch controls this).
+
+[Scoring / Accounting RULES (very important)]
+- MACs are computed ONLY from meta["hyperparams"]; loop tricks or tiling do NOT reduce MACs.
+- If you use dense ops but do NOT declare lowrank_rank/groups/sparsity, evaluator will count dense MACs.
+- Primary objective: Top-1 ↑. Secondary (strong): MACs ↓ via the hyperparams above; then latency/params ↓.
+
+[Deliverable]
+- Provide complete rewritten code for this file. Keep build_model and meta consistent.
+
+Tip: Reducing MACs requires changing lowrank_rank/groups/sparsity in meta["hyperparams"].
+If you keep them as (0,1,1.0), evaluator will count dense MACs and you gain no MACs bonus.
+[How to output your patch]
+Return one or more SEARCH/REPLACE blocks. Each SEARCH MUST exactly match CURRENT source code text.
+Example:
+<<<<<<< SEARCH
+for j in range(self.out_features):
+    s = (xb * self.weight[j]).sum()
+    if self.bias is not None:
+        s = s + self.bias[j]
+    out[b, j] = s
+=======
+# group-sliced accumulation (g groups); write hyperparams in build_model()
+g = max(1, self.groups)
+step = (self.in_features + g - 1) // g
+gid = j % g
+start = gid * step
+end = min(self.in_features, start + step)
+s = (xb[start:end] * self.weight[j, start:end]).sum()
+if self.bias is not None:
+    s = s + self.bias[j]
+out[b, j] = s
+>>>>>>> REPLACE
 IMPORTANT: Make sure your rewritten program maintains the same inputs and outputs
 as the original program, but with improved internal implementation.
 

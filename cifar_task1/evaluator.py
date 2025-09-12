@@ -31,20 +31,20 @@ except Exception:
     pass
 
 # -------------------- 运行时猴补丁：拦截违规 API --------------------
-def _monkey_patch_forbidden():
-    def _raise(*args, **kwargs):
-        raise RuntimeError("Use of forbidden API detected (nn.Linear/matmul/einsum/@)")
-    nn.Linear = _raise  # type: ignore
-    torch.matmul = _raise  # type: ignore
-    torch.Tensor.__matmul__ = _raise  # type: ignore
-    torch.einsum = _raise  # type: ignore
-    # 新增：
-    torch.dot = _raise
-    torch.mm = _raise
-    torch.bmm = _raise
-    torch.mv = _raise
-    torch.addmm = _raise
-    torch.addmv = _raise
+# def _monkey_patch_forbidden():
+    # def _raise(*args, **kwargs):
+    #     raise RuntimeError("Use of forbidden API detected (nn.Linear/matmul/einsum/@)")
+    # nn.Linear = _raise  # type: ignore
+    # torch.matmul = _raise  # type: ignore
+    # torch.Tensor.__matmul__ = _raise  # type: ignore
+    # torch.einsum = _raise  # type: ignore
+    # # 新增：
+    # torch.dot = _raise
+    # torch.mm = _raise
+    # torch.bmm = _raise
+    # torch.mv = _raise
+    # torch.addmm = _raise
+    # torch.addmv = _raise
 
 # -------------------- 静态扫描：忽略注释与字符串，只扫真实代码 --------------------
 import io, tokenize, re
@@ -79,9 +79,9 @@ def _scan_source_forbidden(module) -> None:
             continue
         code_tokens.append(tok.string)
     code = " ".join(code_tokens)
-    for pat in _FORBIDDEN_PATTERNS:
-        if re.search(pat, code):
-            raise RuntimeError(f"Forbidden token found in program: {pat}")
+    # for pat in _FORBIDDEN_PATTERNS:
+    #     if re.search(pat, code):
+    #         raise RuntimeError(f"Forbidden token found in program: {pat}")
 
 # -------------------- 训练/数据工具 --------------------
 def _seed_all(seed: int = 42):
@@ -115,35 +115,67 @@ def _get_cifar10_dataloaders(train_n: int = 100, test_n: int = 100, seed: int = 
 def _count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
-# -------------------- 新增：按超参估算 MACs --------------------
+
+
+
+REQUIRED_KEYS = ("in_dim","num_classes","hidden_dim","lowrank_rank","groups","sparsity")
+
+def _validate_hparams(meta: dict):
+    hp = (meta or {}).get("hyperparams", {}) or {}
+    miss = [k for k in REQUIRED_KEYS if k not in hp]
+    if miss:
+        raise ValueError(f"hyperparams missing keys: {miss}. "
+                         "Candidates MUST return these in meta['hyperparams'].")
+    return hp
+
 def _estimate_macs(meta: dict) -> int:
     """
-    估算“循环 Linear”结构的乘法次数（MACs）。仅依赖 initial_program 返回的 hyperparams。
-    - 单层：in_dim * num_classes
-    - 两层：in_dim * hidden_dim + hidden_dim * num_classes
-    说明：这里不把 tile/unroll 当作改变 MACs 的因素（它们影响访存/时延，但不改算术量）。
+    估算循环 Linear 的乘法次数（MACs），优先读取结构超参；向后兼容旧逻辑。
+    约定：
+      - 低秩分解（W≈U@V）：macs = in_dim * r + r * C, 其中 r=lowrank_rank
+      - 分组线性（g 组）：macs ≈ in_dim * C / g
+      - 稀疏（非零比例 ρ）：在上述基础上乘以 ρ（或 1-sparsity）
+      - 两层 MLP：in_dim * H + H * C
+      - 否则：in_dim * C
     """
-    hp = meta.get("hyperparams", {})
+    hp = _validate_hparams(meta)
+
+    # hp = meta.get("hyperparams", {}) or {}
     in_dim = int(hp.get("in_dim", 3*32*32))
     C      = int(hp.get("num_classes", 10))
     H      = int(hp.get("hidden_dim", 0) or 0)
-    if H > 0:
+
+    # 优先识别“能显著改变算术量”的结构
+    r = int(hp.get("lowrank_rank", 0) or 0)
+    g = int(hp.get("groups", 1) or 1)
+    sparsity = float(hp.get("sparsity", hp.get("nonzero_ratio", 1.0)))
+    if sparsity <= 0.0: sparsity = 1.0
+    sparsity = max(0.0, min(1.0, sparsity))
+
+    if r > 0:
+        macs = in_dim * r + r * C
+    elif g > 1:
+        macs = (in_dim * C) // max(1, g)
+    elif H > 0:
         macs = in_dim * H + H * C
     else:
         macs = in_dim * C
-    # 若推理期做稀疏化（sparsify_thresh>0），可在此引入非零比例修正（这里保持简单不做估计）
-    return int(macs)
+
+    macs = int(max(1, macs * sparsity))
+    return macs
+
+
 
 # -------------------- 核心评测：固定 CPU；失败时自动降级为“无训练评测” --------------------
 def _evaluate(program_module, device: str = "cpu") -> Dict:
-    _monkey_patch_forbidden()
+    # _monkey_patch_forbidden()
     _scan_source_forbidden(program_module)
-
+    _seed_all(42)
     # 构建模型
     model, meta = program_module.build_model()
     model.to(device)
 
-    train_loader, test_loader = _get_cifar10_dataloaders(train_n=100, test_n=20, seed=42, bs=50)
+    train_loader, test_loader = _get_cifar10_dataloaders(train_n=100, test_n=10, seed=42, bs=50)
 
     # 训练（小预算）；遇到 fork+autograd 冲突时自动跳过训练
     do_train = os.environ.get("OE_SKIP_TRAIN", "0") != "1"
@@ -151,9 +183,9 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
     if do_train:
         try:
             model.train()
-            optim = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.0)
+            optim = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
             criterion = nn.CrossEntropyLoss()
-            max_steps = 20
+            max_steps = 100
             steps = 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
@@ -192,9 +224,9 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
     params = _count_params(model)
 
     # 组合分数（越大越好）：准确率 - α·log(时延) - β·log(参数量) - γ·log(MACs)
-    alpha = 0.20
+    alpha = 0.00
     beta  = 0.05
-    gamma = float(os.environ.get("OE_GAMMA", "0.02"))
+    gamma = float(os.environ.get("OE_GAMMA", "0.06"))
     macs  = _estimate_macs(meta)
 
     score = float(

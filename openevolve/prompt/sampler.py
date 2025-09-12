@@ -319,6 +319,29 @@ class PromptSampler:
                 prog["metrics"] = merged
         program = prog
 
+        self._anchor_manager = None
+        self._use_anchor_manager = True
+        try:
+            import importlib
+            AnchorManager = None
+            for modname in ("openevolve.direction.anchor_manager",
+                            "direction.anchor_manager",
+                            "anchor_manager"):
+                try:
+                    m = importlib.import_module(modname)
+                    AnchorManager = getattr(m, "AnchorManager", None)
+                    if AnchorManager:
+                        break
+                except Exception:
+                    pass
+            if AnchorManager is not None:
+                self._anchor_manager = AnchorManager(config=getattr(self, "direction_cfg", None))
+                logger.info("[DIRFB] AnchorManager enabled via %s", AnchorManager.__module__)
+            else:
+                logger.info("[DIRFB] AnchorManager module not found; using local anchor logic.")
+        except Exception as e:
+            logger.info("[DIRFB] AnchorManager not used (%s); fallback to local anchor logic.", e)
+
         # Anchor object we will use
         anchor = None
         anchor_id = None
@@ -356,7 +379,8 @@ class PromptSampler:
                 anchor_id = (anchor.get("id") if isinstance(anchor, dict) else None)
         except Exception as e:
             logger.debug("Local anchor selection failed: %s", e)
-
+        print("anchor:",anchor,anchor_id)
+            # anchor: None None
             # ========== 3) Direction + step + render ==========
         try:
             if anchor:
@@ -618,31 +642,54 @@ class PromptSampler:
                 best_score = score; best = p
         return best
 
-    def _hallucinated_anchor(self, cur: dict, history: list, k: int, max_param_inc_pct: float):
+    def _is_stagnating(self, history: list, k: int, eps: float) -> bool:
+        """用最近 k 条历史的 acc 变化判断是否平台期"""
         if not history or len(history) < 2:
-            return None
+            return False
+        tail = history[-min(k, len(history)):]
+        acc0 = self._m(tail[0], "acc", 0.0)
+        acc1 = self._m(tail[-1], "acc", 0.0)
+        return (acc1 - acc0) < float(eps)
+
+    def _hallucinated_anchor(self, cur: dict, history: list, k: int, max_param_inc_pct: float):
+        cur_acc = self._m(cur, "acc", 0.0)
+        cur_lat = self._m(cur, "latency_ms", 0.0)
+        cur_par = self._m(cur, "params", 0.0)
+
+        # 历史不足：给“启动锚点”
+        if not history or len(history) < 2:
+            return {
+                "id": "virtual_anchor_bootstrap",
+                "metrics": {
+                    "acc": max(0.0, cur_acc + 0.02),  # +2% 绝对提升目标
+                    "latency_ms": max(0.0, cur_lat * 0.90),  # 期望 -10% latency
+                    "combined_score": self._m(cur, "combined_score", 0.0),
+                },
+                "resources": {
+                    "params": max(1.0, cur_par * (1.0 + float(max_param_inc_pct))),
+                    "flops": self._m(cur, "flops", 0.0),
+                    "mem_mb": self._r(cur, "mem_mb", 0.0),
+                },
+            }
+
+        # 历史充分：保留你原来的单位增益外推
         tail = history[-min(k, len(history)):]
         d_acc = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
         d_param = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
         d_lat = self._m(tail[-1], "latency_ms", 0.0) - self._m(tail[0], "latency_ms", 0.0)
 
         def sdiv(a, b): return float(a) / (abs(float(b)) + 1e-9)
+
         acc_target = self._m(cur, "acc", 0.0) + 0.8 * (sdiv(d_acc, d_param) + sdiv(d_acc, d_lat))
         params_target = self._m(cur, "params", 0.0) * (1.0 + float(max_param_inc_pct))
-
-        # 构造“虚拟锚点”
         return {
             "id": "virtual_anchor",
-            "metrics": {
-                "acc": acc_target,
-                "latency_ms": max(0.0, self._m(cur, "latency_ms", 0.0) - 0.1 * abs(d_lat)),
-                "combined_score": self._m(cur, "combined_score", 0.0)
-            },
-            "resources": {
-                "params": params_target,
-                "flops": self._m(cur, "flops", 0.0),
-                "mem_mb": self._r(cur, "mem_mb", 0.0),
-            },
+            "metrics": {"acc": acc_target,
+                        "latency_ms": max(0.0, self._m(cur, "latency_ms", 0.0) - 0.1 * abs(d_lat)),
+                        "combined_score": self._m(cur, "combined_score", 0.0)},
+            "resources": {"params": params_target,
+                          "flops": self._m(cur, "flops", 0.0),
+                          "mem_mb": self._r(cur, "mem_mb", 0.0)},
         }
 
     def _direction_and_step(self, cur: dict, anc: dict, weights: dict, history: list, k: int):
@@ -702,33 +749,44 @@ class PromptSampler:
         return any(k in m for k in ("acc", "accuracy", "top1", "latency_ms", "infer_time_s", "params", "macs", "flops"))
 
     def _select_anchor(self, cur: dict, history: list, prev: list, top: list, cfg: dict):
+        # 0) 组候选池（带核心指标）；没有就把当前点放进去
         pool = [p for p in ((top or []) + (prev or [])) if p and self._has_core_metrics(p)]
-        # 若候选仍为空，至少把当前点塞进去，避免全 0
         if not pool and self._has_core_metrics(cur):
             pool = [cur]
 
+        # 兜底：候选为空 → 直接幻想锚点
         if not pool:
             return self._hallucinated_anchor(
                 cur, history, cfg["stagnation"]["k"],
                 cfg["actions"].get("max_param_increase_pct", 0.05)
             )
 
-        # 1) Pareto frontier on raw objectives
+        # 1) 同资源优选（更稳的 exploitation）
+        tol = cfg.get("resource_tolerances", {"params_pct": 0.10, "flops_pct": 0.20, "mem_pct": 0.15})
+        same_res = [p for p in pool if self._resource_close(cur, p, tol)]
+        if same_res:
+            cand = self._pick_same_resource_anchor(cur, same_res, tol)
+            if cand is not None:
+                return cand
+
+        # 2) 平台期 or 无同资源候选 → 走异质探索（diversity）
+        stag_cfg = cfg.get("stagnation", {"k": 5, "slope_eps": 1e-3})
+        if self._is_stagnating(history, int(stag_cfg.get("k", 5)), float(stag_cfg.get("slope_eps", 1e-3))):
+            cand = self._pick_hetero_anchor(cur, pool)
+            if cand is not None:
+                return cand
+
+        # 3) 正常情况：Pareto + 拥挤度 + AI-regime（你现有逻辑）
         frontier = self._pareto_frontier(pool)
         stats = self._robust_norm_stats(pool + [cur])
-
-        # 2) Ideal point z* in normalized space
         Fh = [self._normalize_obj(self._obj_vec(p), stats) for p in frontier]
         Z = list(map(min, zip(*Fh))) if Fh else [0.0, 0.0, 0.0]
 
-        # 3) Regime-aware weights
         regime = self._ai_regime(cur, cfg)
         base_w = cfg.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3})
         W = self._regime_aware_weights(base_w, regime)
-
         crowd = self._crowding_distance(frontier, stats)
 
-        # AI “向分界靠近”奖励（更接近 Mb 的候选更好）
         Mb = float(cfg.get("ai_mb_threshold", 32.0))
         ai_cur = self._ai_proxy(cur)
 
@@ -741,11 +799,11 @@ class PromptSampler:
                        W["params"] * abs(fhat[2] - Z[2]))
             ai_p = self._ai_proxy(p)
             ai_term = (abs(ai_cur - Mb) - abs(ai_p - Mb))  # closer-to-Mb is rewarded
-
             U = -tche + 0.2 * crowd.get(pid, 0.0) + 0.1 * ai_term
             if U > bestU:
                 bestU, best = U, p
 
+        # 4) 仍无 → 幻想锚点（永不返回 None）
         return best or self._hallucinated_anchor(
             cur, history, cfg["stagnation"]["k"],
             cfg["actions"].get("max_param_increase_pct", 0.05)
