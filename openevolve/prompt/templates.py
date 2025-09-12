@@ -113,6 +113,7 @@ FULL_REWRITE_USER_TEMPLATE = """# Current Program Information
 
 # Task
 Rewrite the program to improve its performance on the specified metrics.
+Goal = better wall-clock time & accuracy. It is ALLOWED (and encouraged) to refactor this MLP-style
 Provide the complete new program code.
 [Invariants — MUST KEEP]
 - Export a function: build_model() -> (nn.Module, meta: dict)
@@ -125,7 +126,6 @@ Provide the complete new program code.
 [You MAY rewrite freely]
 - You may add/remove local variables, module attributes (parameters/buffers), and helpers.
 - You may switch structure: low-rank factorization, group linear, sparsify, 2-layer MLP, or others.
-- You MAY use matmul/mm/einsum/F.linear if available (runtime switch controls this).
 
 [Scoring / Accounting RULES (very important)]
 - MACs are computed ONLY from meta["hyperparams"]; loop tricks or tiling do NOT reduce MACs.

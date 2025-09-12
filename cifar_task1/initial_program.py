@@ -9,13 +9,7 @@ IN_DIM = 3 * 32 * 32
 NUM_CLASSES = 10
 
 class LinearLoopLayer(nn.Module):
-    """
-    Evolvable linear layer that supports three structure knobs:
-      - lowrank_rank (int r > 0):  W ≈ V[r,out] @ U[r,in], MACs = in_dim*r + r*out
-      - groups (int g > 1):        each output j only connects to a 1/g slice of inputs, MACs ≈ in_dim*out/g
-      - sparsity (float rho∈(0,1]): keep roughly rho fraction of input elements per output (deterministic subsampling)
-    Forbid mm/matmul/einsum/dot by implementing all reductions as elementwise-mul + sum.
-    """
+
     def __init__(self, in_features: int, out_features: int,
                  bias: bool = True, lowrank_rank: int = 0,
                  groups: int = 1, sparsity: float = 1.0):

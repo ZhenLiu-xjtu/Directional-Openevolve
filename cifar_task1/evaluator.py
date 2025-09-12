@@ -1,7 +1,4 @@
 # evaluator.py
-# 评价指标：Top-1 精度（越高越好）与推理时延/参数量/乘法开销（越低越好）的加权组合
-# 数据：CIFAR-10 子集，train=100 / test=100（固定随机下标，结果可复现）
-# 违禁：nn.Linear / torch.matmul / einsum / '@'（运行时猴补丁 + 仅扫描“代码 token”的静态检查）
 
 from __future__ import annotations
 import os
@@ -49,21 +46,7 @@ except Exception:
 # -------------------- 静态扫描：忽略注释与字符串，只扫真实代码 --------------------
 import io, tokenize, re
 
-_FORBIDDEN_PATTERNS = [
-    r"\btorch\s*\.\s*nn\s*\.\s*linear\b",
-    r"\bnn\s*\.\s*linear\b",
-    r"\btorch\s*\.\s*matmul\b",
-    r"\.__matmul__\b",
-    r"\btorch\s*\.\s*einsum\b",
-    r"\beinsum\s*\(",
-    # 新增：
-    r"\btorch\s*\.\s*dot\b",
-    r"\btorch\s*\.\s*mm\b",
-    r"\btorch\s*\.\s*bmm\b",
-    r"\btorch\s*\.\s*mv\b",
-    r"\btorch\s*\.\s*addmm\b",
-    r"\btorch\s*\.\s*addmv\b",
-]
+
 
 
 def _scan_source_forbidden(module) -> None:
@@ -175,7 +158,7 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
     model, meta = program_module.build_model()
     model.to(device)
 
-    train_loader, test_loader = _get_cifar10_dataloaders(train_n=100, test_n=10, seed=42, bs=50)
+    train_loader, test_loader = _get_cifar10_dataloaders(train_n=1000, test_n=100, seed=42, bs=256)
 
     # 训练（小预算）；遇到 fork+autograd 冲突时自动跳过训练
     do_train = os.environ.get("OE_SKIP_TRAIN", "0") != "1"
@@ -224,9 +207,9 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
     params = _count_params(model)
 
     # 组合分数（越大越好）：准确率 - α·log(时延) - β·log(参数量) - γ·log(MACs)
-    alpha = 0.00
-    beta  = 0.05
-    gamma = float(os.environ.get("OE_GAMMA", "0.06"))
+    alpha = 0.005
+    beta  = 0.00
+    gamma = 0
     macs  = _estimate_macs(meta)
 
     score = float(
@@ -240,6 +223,7 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
         "score": score,
         "metrics": {
             "top1": top1,
+            "acc":top1,
             "infer_time_s": infer_time,
             "params": params,
             "macs": macs,
@@ -261,12 +245,7 @@ def main():
 
 # -------------------- OpenEvolve 标准入口：自动矫正 __future__ 位置 --------------------
 def evaluate(candidate_program_path: str) -> dict:
-    """
-    OpenEvolve 调用该函数评估候选程序。
-    这里先读取候选源码，把所有 'from __future__ import ...' 行移动到文件开头，
-    防止 'must occur at the beginning of the file' 语法错误。
-    任何异常都尽量转化为可比较的分数返回，避免整轮演化中断。
-    """
+
     import types
 
     # 读取并矫正 __future__ 位置

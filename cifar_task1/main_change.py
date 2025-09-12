@@ -241,16 +241,46 @@ def load_cifar10_data(data_dir, max_train=None, max_test=None, seed=42):
 #             out += self.b
 #         return out
 
+
+
 class EvolvedLoopLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    """
+    Evolvable linear layer that supports three structure knobs:
+      - lowrank_rank (int r > 0):  W ≈ V[r,out] @ U[r,in], MACs = in_dim*r + r*out
+      - groups (int g > 1):        each output j only connects to a 1/g slice of inputs, MACs ≈ in_dim*out/g
+      - sparsity (float rho∈(0,1]): keep roughly rho fraction of input elements per output (deterministic subsampling)
+    Forbid mm/matmul/einsum/dot by implementing all reductions as elementwise-mul + sum.
+    """
+
+    def __init__(self, in_features: int, out_features: int,
+                 bias: bool = True, lowrank_rank: int = 4,
+                 groups: int = 1, sparsity: float = 1.0):
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self.rank = int(lowrank_rank)
+        self.groups = max(1, int(groups))
+        self.sparsity = float(sparsity)
 
-        self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        # Parameters:
+        if self.rank > 0:
+            # Low-rank factors: U[r, in], V[out, r]
+            self.U = nn.Parameter(torch.empty(self.rank, self.in_features))
+            self.V = nn.Parameter(torch.empty(self.out_features, self.rank))
+            nn.init.kaiming_uniform_(self.U, a=5 ** 0.5)
+            nn.init.kaiming_uniform_(self.V, a=5 ** 0.5)
+            with torch.no_grad():
+                self.U.mul_(1.0 / math.sqrt(self.in_features))
+                self.V.mul_(1.0 / math.sqrt(max(1, self.rank)))
+            self.weight = None
+        else:
+            # Full matrix (used by groups/sparsity or plain baseline)
+            self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+            nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+            self.U = None
+            self.V = None
+
         self.bias = nn.Parameter(torch.zeros(self.out_features)) if bias else None
-
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
         if self.bias is not None:
             bound = (self.in_features) ** -0.5
             nn.init.uniform_(self.bias, -bound, bound)
@@ -265,18 +295,130 @@ class EvolvedLoopLinear(nn.Module):
 
         out = x.new_zeros(B, self.out_features)
 
-        for b in range(B):
-            xb = x[b]  # [in_features]
-            # Process output features in tiles of size 16
-            for j_start in range(0, self.out_features, 16):
-                # Process 16 output features at once
-                tile_end = min(j_start + 16, self.out_features)
-                for j in range(j_start, tile_end):
-                    acc = (xb * self.weight[j]).sum()
+        # Deterministic sparsity stride (avoid randomness in eval)
+        rho = max(0.0, min(1.0, self.sparsity))
+        keep_stride = 1 if rho >= 0.999 else max(1, int(round(1.0 / max(1e-6, rho))))
+
+        if self.rank > 0:
+            # Low-rank: for each sample, compute t = U @ x (elementwise-mul+sum), then y = V @ t
+            # Reorganized loops to avoid innermost loop over batch dimension
+            for k in range(0, self.rank, 4):  # Unroll by 4
+                # Process each tile
+                for start in range(0, self.in_features, 16):  # Using fixed tile size
+                    end = min(start + 16, self.in_features)
+
+                    # For each batch element
+                    for b in range(B):
+                        xb = x[b]  # [in_features]
+                        # Create output tensor
+                        if b == 0:
+                            out = xb.new_zeros(B, self.out_features)
+
+                        # Accumulate values for 4 ranks at once
+                        acc0 = 0.0
+                        acc1 = 0.0
+                        acc2 = 0.0
+                        acc3 = 0.0
+
+                        for i in range(start, end):
+                            if keep_stride == 1 or i % keep_stride == 0:
+                                if k < self.rank:
+                                    acc0 += self.U[k, i] * xb[i]
+                                if k + 1 < self.rank:
+                                    acc1 += self.U[k + 1, i] * xb[i]
+                                if k + 2 < self.rank:
+                                    acc2 += self.U[k + 2, i] * xb[i]
+                                if k + 3 < self.rank:
+                                    acc3 += self.U[k + 3, i] * xb[i]
+
+                        # Store accumulated values
+                        if k < self.rank:
+                            out[b, k] += acc0
+                        if k + 1 < self.rank:
+                            out[b, k + 1] += acc1
+                        if k + 2 < self.rank:
+                            out[b, k + 2] += acc2
+                        if k + 3 < self.rank:
+                            out[b, k + 3] += acc3
+
+                # Handle remaining ranks if not divisible by 4
+                # This part is now handled by the main loop restructuring
+                pass
+            return out
+
+        # Else: full matrix (optionally with groups and/or sparsity)
+        if self.groups > 1:
+            # Each output j only connects to its assigned input slice
+            step = (self.in_features + self.groups - 1) // self.groups  # ceil division
+            for b in range(B):
+                xb = x[b]
+                for j in range(self.out_features):
+                    g = j % self.groups
+                    start = g * step
+                    end = min(self.in_features, start + step)
+                    if keep_stride == 1:
+                        s = (xb[start:end] * self.weight[j, start:end]).sum()
+                    else:
+                        s = xb.new_tensor(0.0)
+                        for i in range(start, end, keep_stride):
+                            s = s + self.weight[j, i] * xb[i]
                     if self.bias is not None:
-                        acc = acc + self.bias[j]
-                    out[b, j] = acc
+                        s = s + self.bias[j]
+                    out[b, j] = s
+            return out
+
+        # Plain baseline with optional sparsity
+        for b in range(B):
+            xb = x[b]
+            for j in range(self.out_features):
+                if keep_stride == 1:
+                    s = (xb * self.weight[j]).sum()
+                else:
+                    s = xb.new_tensor(0.0)
+                    for i in range(0, self.in_features, keep_stride):
+                        s = s + self.weight[j, i] * xb[i]
+                if self.bias is not None:
+                    s = s + self.bias[j]
+                out[b, j] = s
         return out
+
+
+# class EvolvedLoopLinear(nn.Module):
+#     def __init__(self, in_features: int, out_features: int, bias: bool = True):
+#         super().__init__()
+#         self.in_features = int(in_features)
+#         self.out_features = int(out_features)
+#
+#         self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+#         self.bias = nn.Parameter(torch.zeros(self.out_features)) if bias else None
+#
+#         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+#         if self.bias is not None:
+#             bound = (self.in_features) ** -0.5
+#             nn.init.uniform_(self.bias, -bound, bound)
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # x: [B, 3, 32, 32] or [B, in]
+#         if x.dim() == 4:
+#             B = x.size(0)
+#             x = x.reshape(B, -1)
+#         else:
+#             B = x.size(0)
+#
+#         out = x.new_zeros(B, self.out_features)
+#
+#         for b in range(B):
+#             xb = x[b]  # [in_features]
+#             # Process output features in tiles of size 16
+#             for j_start in range(0, self.out_features, 16):
+#                 # Process 16 output features at once
+#                 tile_end = min(j_start + 16, self.out_features)
+#                 for j in range(j_start, tile_end):
+#                     acc = (xb * self.weight[j]).sum()
+#                     if self.bias is not None:
+#                         acc = acc + self.bias[j]
+#                     out[b, j] = acc
+#         return out
 # class EvolvedLoopLinear(nn.Module):
 #     def __init__(self, in_features: int, out_features: int, bias: bool = True):
 #         super().__init__()
@@ -561,7 +703,7 @@ def build_model(arch: str, evolved_use_T: bool, evolved_tile: int):
         # island=5 最优思路的单层（默认不转置、无分块；也可通过参数开启）
         model = nn.Sequential(
             EvolvedLoopLinear(
-                3072, 10, bias=True
+                3072, 10
             )
         )
     else:

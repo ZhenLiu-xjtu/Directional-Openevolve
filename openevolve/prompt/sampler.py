@@ -22,6 +22,8 @@ class PromptSampler:
         self._system_template_key = "system_message"
         self._user_template_key_diff = "diff_user"
         self._user_template_key_full = "full_rewrite_user"
+        self._am_get_all_programs = lambda: (self._ctx_prev or []) + (self._ctx_top or [])
+        self._am_get_island_frontiers = lambda: {}
 
     def set_templates(self, system_key="system_message", user_key_diff="diff_user", user_key_full="full_rewrite_user"):
         self._system_template_key = system_key
@@ -234,12 +236,25 @@ class PromptSampler:
 
         auto_dir = ""
         try:
-            if parent_program_dict:
-                auto_dir = self._format_direction_feedback(
-                    parent_program_dict,
-                    cur_metrics_override=program_metrics
-                ).strip()
-                if auto_dir:
+            # 用 parent 作为基，但若它缺核心指标（常见于首轮），就退化为“当前指标 stub”
+            base_prog = parent_program_dict or {}
+            if not self._has_core_metrics(base_prog):
+                base_prog = {
+                    "id": f"round_{int(evolution_round):05d}_current",
+                    "metrics": program_metrics or {},
+                    "resources": {
+                        "params": (program_metrics or {}).get("params", 0.0),
+                        "flops": (program_metrics or {}).get("macs", 0.0),
+                        "mem_mb": 0.0,
+                    },
+                }
+
+            auto_dir = self._format_direction_feedback(
+                base_prog,  # ← 传“有 metrics 的那个”
+                cur_metrics_override=None  # 已经塞进去了，这里不再 override
+            ).strip()
+
+            if auto_dir:
                     logger.info("DF preview(auto): %s", auto_dir.splitlines()[:3])
 
         except Exception as _e:
@@ -307,16 +322,18 @@ class PromptSampler:
         top = getattr(self, "_ctx_top", []) or []
         hist = prev
 
-        # 若 parent/prev/top 缺关键指标，用当前 program_metrics 做兜底
         prog = dict(program or {})
-        if cur_metrics_override:
-            pm = (prog.get("metrics") or {})
-            has_core = any(
-                k in pm for k in ("acc", "accuracy", "top1", "latency_ms", "infer_time_s", "params", "macs", "flops"))
-            if not has_core:
-                merged = dict(pm)
-                merged.update(cur_metrics_override or {})
-                prog["metrics"] = merged
+        pm = (prog.get("metrics") or {})
+        merged = dict(pm)
+        merged.update(cur_metrics_override or {})  # ← 无条件合并当前轮指标
+        prog["metrics"] = merged
+
+        # 若没 resources，就从 metrics 回填常用资源键
+        res = dict(prog.get("resources") or {})
+        for k in ("params", "macs", "flops", "mem_mb"):
+            if k not in res and k in merged:
+                res[k] = merged[k]
+        prog["resources"] = res
         program = prog
 
         self._anchor_manager = None
@@ -335,8 +352,15 @@ class PromptSampler:
                 except Exception:
                     pass
             if AnchorManager is not None:
-                self._anchor_manager = AnchorManager(config=getattr(self, "direction_cfg", None))
-                logger.info("[DIRFB] AnchorManager enabled via %s", AnchorManager.__module__)
+                try:
+                    self._anchor_manager = AnchorManager(
+                        get_all_programs=self._am_get_all_programs,
+                        get_island_frontiers=self._am_get_island_frontiers,
+                        config=getattr(self, "direction_cfg", None) or {}
+                    )
+                    logger.info("[DIRFB] AnchorManager enabled via %s", AnchorManager.__module__)
+                except Exception as e:
+                    logger.info("[DIRFB] AnchorManager init failed (%s); fallback to local anchor logic.", e)
             else:
                 logger.info("[DIRFB] AnchorManager module not found; using local anchor logic.")
         except Exception as e:
@@ -446,28 +470,30 @@ class PromptSampler:
     # === Linear-DDO helpers: robust normalization / Pareto / crowding / AI regime ===
 
     def _obj_vec(self, prog: dict) -> List[float]:
-        """3-obj (all 'smaller is better'): [-acc, latency_ms, params]"""
+        """2-obj (all 'smaller is better'): [-acc, infer_time_s]"""
         return [
             -float(self._m(prog, "acc", 0.0)),
-            float(self._m(prog, "latency_ms", 0.0)),
-            float(self._m(prog, "params", 0.0)),
+            float(self._m(prog, "infer_time_s", 0.0)),
         ]
 
+
     def _robust_norm_stats(self, pool: List[dict]):
-        cols = list(zip(*[self._obj_vec(p) for p in pool])) if pool else [[], [], []]
+        dim = len(self._obj_vec(pool[0])) if pool else 2
+        cols = list(zip(*[self._obj_vec(p) for p in pool])) if pool else [[] for _ in range(dim)]
         stats = []
         for col in cols:
             if not col:
                 stats.append((0.0, 1.0, 0.0))  # median, IQR, min
                 continue
-            xs = sorted(col);
+            xs = sorted(col)
             n = len(xs)
             med = xs[n // 2]
             q1, q3 = xs[n // 4], xs[(3 * n) // 4]
             iqr = max(1e-9, q3 - q1)
             mn = xs[0]
             stats.append((med, iqr, mn))
-        return stats  # list of (median, iqr, min)
+        return stats
+
 
     def _normalize_obj(self, f: List[float], stats) -> List[float]:
         out = []
@@ -480,17 +506,22 @@ class PromptSampler:
     def _pareto_frontier(self, pool: List[dict]) -> List[dict]:
         """Simple non-dominated filter on raw f (not normalized)"""
         Fs = [self._obj_vec(p) for p in pool]
+        if not Fs:
+            return []
+        m = len(Fs[0])
         nd = []
         for i, Fi in enumerate(Fs):
             dominated = False
             for j, Fj in enumerate(Fs):
-                if i == j: continue
-                if all(Fj[k] <= Fi[k] for k in range(3)) and any(Fj[k] < Fi[k] for k in range(3)):
-                    dominated = True;
+                if i == j:
+                    continue
+                if all(Fj[k] <= Fi[k] for k in range(m)) and any(Fj[k] < Fi[k] for k in range(m)):
+                    dominated = True
                     break
             if not dominated:
                 nd.append(pool[i])
         return nd
+
 
     def _crowding_distance(self, frontier: List[dict], stats) -> Dict[str, float]:
         """NSGA-II style crowding distance on normalized f-hat"""
@@ -553,27 +584,26 @@ class PromptSampler:
             }
 
         return {
-            "metric_keys": cfg_dir.get("metric_keys", ["acc", "latency_ms", "params"]),
-            "weights": cfg_dir.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3}),
-            "resource_tolerances": cfg_dir.get("resource_tolerances",
-                                               {"params_pct": 0.10, "flops_pct": 0.20, "mem_pct": 0.15}),
+            "metric_keys": cfg_dir.get("metric_keys", ["acc", "infer_time_s"]),
+            "weights": cfg_dir.get("weights", {"perf": 1.0, "latency": 0.5}),
+            "resource_tolerances": cfg_dir.get("resource_tolerances", {"infer_time_pct": 0.10}),
             "stagnation": cfg_dir.get("stagnation", {"k": 5, "slope_eps": 1e-3}),
             "diversify_penalty_cos": cfg_dir.get("diversify_penalty_cos", 0.92),
-            "actions": actions,
-            # Linear-DDO extra:
-            "ai_mb_threshold": cfg_dir.get("ai_mb_threshold", 32.0),
+            "actions": actions,  # 可在 actions 里加 max_time_decrease_pct
+            "bootstrap_infer_time_default": cfg_dir.get("bootstrap_infer_time_default", 0.0),
         }
+
 
     def _m(self, prog: dict, key: str, default=0.0):
         """安全获取 metrics 的键；支持常见别名"""
         m = (prog or {}).get("metrics", {}) or {}
         alias = {
             "acc": ["acc", "accuracy", "top1", "top1_acc"],
-            "latency_ms": ["latency_ms", "infer_time_ms", "infer_time_s", "latency_s"],
-            "flops": ["macs", "flops"],
+            "infer_time_s": ["infer_time_s", "infer_times_s", "latency_s"],  # 接受你提到的拼写变体
+            "latency_ms": ["latency_ms", "infer_time_ms"],  # 仅为兼容旧日志
             "combined_score": ["combined_score"],
-            "params": ["params", "num_params"],
         }
+
         keys = alias.get(key, [key])
         for k in keys:
             v = m.get(k, None)
@@ -587,7 +617,7 @@ class PromptSampler:
                 try: return float(v)
                 except Exception: return v
         # 资源类也可能放在 resources 里
-        if key in ("params", "flops", "mem_mb"):
+        if key in ("params", "flops", "mem_mb", "infer_time_s"):
             r = (prog or {}).get("resources", {}) or {}
             v = r.get(key, None)
             if v is not None:
@@ -604,16 +634,14 @@ class PromptSampler:
         return float(v) if isinstance(v, (int, float)) else (v if v is not None else default)
 
     def _resource_close(self, a: dict, b: dict, tol: dict) -> bool:
-        def ok(key, pct):
-            av = self._r(a, key, None); bv = self._r(b, key, None)
-            if av is None or bv is None: return False
+        def ok_time(pct):
+            av = self._r(a, "infer_time_s", None); bv = self._r(b, "infer_time_s", None)
+            if av is None or bv is None:
+                return False
             denom = max(1e-9, float(av))
             return abs(float(av) - float(bv)) / denom <= pct
-        return (
-            ok("params", tol.get("params_pct", 0.10)) and
-            (ok("flops",  tol.get("flops_pct",  0.20)) or ok("macs", tol.get("flops_pct", 0.20))) and
-            ok("mem_mb",  tol.get("mem_pct",    0.15))
-        )
+        return ok_time(tol.get("infer_time_pct", 0.10))
+
 
     def _pick_same_resource_anchor(self, cur: dict, candidates: list, tol: dict):
         best = None; best_gain = 0.0
@@ -629,18 +657,19 @@ class PromptSampler:
         return best
 
     def _pick_hetero_anchor(self, cur: dict, candidates: list):
-        # 简化版“思路差异”：以 (params, flops, latency) 差异 + acc 提升的线性组合
-        cur_vec = [self._m(cur, "acc", 0.0), self._m(cur, "latency_ms", 0.0), self._m(cur, "params", 0.0)]
+        # 以时间差异 + acc 提升的线性组合
+        cur_vec = [self._m(cur, "acc", 0.0), self._m(cur, "infer_time_s", 0.0)]
         best = None; best_score = -1e18
         for p in candidates:
             if p is cur:
                 continue
-            pv = [self._m(p, "acc", 0.0), self._m(p, "latency_ms", 0.0), self._m(p, "params", 0.0)]
-            diff = abs(pv[2] - cur_vec[2]) + abs(pv[1] - cur_vec[1])  # 资源&延迟差异
-            score = (pv[0] - cur_vec[0]) + 0.3 * diff                 # acc 提升 + 差异性
+            pv = [self._m(p, "acc", 0.0), self._m(p, "infer_time_s", 0.0)]
+            diff = abs(pv[1] - cur_vec[1])  # 时间差异
+            score = (pv[0] - cur_vec[0]) + 0.3 * diff
             if score > best_score:
                 best_score = score; best = p
         return best
+
 
     def _is_stagnating(self, history: list, k: int, eps: float) -> bool:
         """用最近 k 条历史的 acc 变化判断是否平台期"""
@@ -653,43 +682,38 @@ class PromptSampler:
 
     def _hallucinated_anchor(self, cur: dict, history: list, k: int, max_param_inc_pct: float):
         cur_acc = self._m(cur, "acc", 0.0)
-        cur_lat = self._m(cur, "latency_ms", 0.0)
-        cur_par = self._m(cur, "params", 0.0)
+        cur_time = self._m(cur, "infer_time_s", 0.0)
+        if cur_time <= 0.0:
+            cur_time = self._r(cur, "infer_time_s", 0.0)
+        if cur_time <= 0.0:
+            cur_time = float(self._aa_cfg().get("bootstrap_infer_time_default", 0.0))
 
-        # 历史不足：给“启动锚点”
+        # 历史不足：给“启动锚点”（acc +2%，时间 -10%）
         if not history or len(history) < 2:
             return {
                 "id": "virtual_anchor_bootstrap",
                 "metrics": {
-                    "acc": max(0.0, cur_acc + 0.02),  # +2% 绝对提升目标
-                    "latency_ms": max(0.0, cur_lat * 0.90),  # 期望 -10% latency
-                    "combined_score": self._m(cur, "combined_score", 0.0),
+                    "acc": max(0.0, cur_acc + 0.02),
                 },
                 "resources": {
-                    "params": max(1.0, cur_par * (1.0 + float(max_param_inc_pct))),
-                    "flops": self._m(cur, "flops", 0.0),
-                    "mem_mb": self._r(cur, "mem_mb", 0.0),
+                    "infer_time_s": max(0.0, cur_time * 0.90),
                 },
             }
 
-        # 历史充分：保留你原来的单位增益外推
+        # 历史充分：用 acc/时间 的单位增益外推
         tail = history[-min(k, len(history)):]
         d_acc = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
-        d_param = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
-        d_lat = self._m(tail[-1], "latency_ms", 0.0) - self._m(tail[0], "latency_ms", 0.0)
+        d_time = self._m(tail[-1], "infer_time_s", 0.0) - self._m(tail[0], "infer_time_s", 0.0)
 
-        def sdiv(a, b): return float(a) / (abs(float(b)) + 1e-9)
+        def sdiv(a, b):
+            return float(a) / (abs(float(b)) + 1e-9)
 
-        acc_target = self._m(cur, "acc", 0.0) + 0.8 * (sdiv(d_acc, d_param) + sdiv(d_acc, d_lat))
-        params_target = self._m(cur, "params", 0.0) * (1.0 + float(max_param_inc_pct))
+        acc_target = self._m(cur, "acc", 0.0) + 0.8 * sdiv(d_acc, d_time)
+        time_target = max(0.0, cur_time - 0.1 * abs(d_time))
         return {
             "id": "virtual_anchor",
-            "metrics": {"acc": acc_target,
-                        "latency_ms": max(0.0, self._m(cur, "latency_ms", 0.0) - 0.1 * abs(d_lat)),
-                        "combined_score": self._m(cur, "combined_score", 0.0)},
-            "resources": {"params": params_target,
-                          "flops": self._m(cur, "flops", 0.0),
-                          "mem_mb": self._r(cur, "mem_mb", 0.0)},
+            "metrics": {"acc": acc_target},
+            "resources": {"infer_time_s": time_target},
         }
 
     def _direction_and_step(self, cur: dict, anc: dict, weights: dict, history: list, k: int):
@@ -698,25 +722,25 @@ class PromptSampler:
         f_cur = self._normalize_obj(self._obj_vec(cur), stats)
         f_tar = self._normalize_obj(self._obj_vec(anc), stats)
 
-        dv = [f_tar[j] - f_cur[j] for j in range(3)]
+        m = len(f_cur)
+        dv = [f_tar[j] - f_cur[j] for j in range(m)]
         norm = (sum(x * x for x in dv) ** 0.5) or 1.0
         dv = [x / norm for x in dv]
 
-        # Trust-region via recent unit gains
+        # 信任域：用 acc/时间 的单位增益
         step = 0.3
         if history and len(history) >= 2:
             tail = history[-min(k, len(history)):]
             dacc = self._m(tail[-1], "acc", 0.0) - self._m(tail[0], "acc", 0.0)
-            dpar = self._m(tail[-1], "params", 0.0) - self._m(tail[0], "params", 0.0)
-            dlat = self._m(tail[-1], "latency_ms", 0.0) - self._m(tail[0], "latency_ms", 0.0)
-            g = 0.6 * (dacc / (abs(dpar) + 1e-9)) + 0.4 * (dacc / (abs(dlat) + 1e-9))
+            dt   = self._m(tail[-1], "infer_time_s", 0.0) - self._m(tail[0], "infer_time_s", 0.0)
+            g = (dacc / (abs(dt) + 1e-9))
             step = max(0.1, min(1.0, 0.5 * g + 0.3))
 
         edit_budget = max(1, min(4, int(round(1 + 3 * step))))
+        cur_time = self._m(cur, "infer_time_s", 0.0)
         targets = {
-            "acc_target": max(0.0, self._m(cur, "acc", 0.0) - dv[0] * 0.02),  # dv[0] is -acc direction
-            "latency_target": max(0.0, self._m(cur, "latency_ms", 0.0) + dv[1] * 5.0),
-            "params_target": max(0.0, self._m(cur, "params", 0.0) + dv[2] * 0.05 * self._m(cur, "params", 0.0)),
+            "acc_target":  max(0.0, self._m(cur, "acc", 0.0) - dv[0] * 0.02),    # dv[0] 对应 -acc
+            "time_target": max(0.0, cur_time + dv[1] * 0.10 * max(1e-9, cur_time)),
             "edit_budget": edit_budget,
         }
         return dv, step, targets
@@ -724,29 +748,34 @@ class PromptSampler:
     def _render_anchor_text(self, cur: dict, anchor: dict, dv: list, step: float, actions: dict, max_params_pct: float):
         cur_acc = self._m(cur, "acc", 0.0)
         tar_acc = self._m(anchor, "acc", cur_acc)
-        cur_par = self._m(cur, "params", 0.0)
-        if cur_par <= 0:
-            cur_par = self._m(anchor, "params", 0.0)
-        anch_par = self._m(anchor, "params", 0.0) or cur_par
-        budget = max(1.0, min(cur_par * (1.0 + float(max_params_pct)), anch_par))
 
-        regime = self._ai_regime(cur, self._aa_cfg())
+        cur_t  = self._m(cur, "infer_time_s", 0.0)
+        anch_t = self._r(anchor, "infer_time_s", None)
+        if anch_t is None:
+            anch_t = self._m(anchor, "infer_time_s", cur_t)
+        max_time_dec = float(self._aa_cfg().get("actions", {}).get("max_time_decrease_pct", 0.10))
+        budget = max(0.0, min(cur_t * (1.0 - max_time_dec), anch_t))
+
         prefer_ops = ", ".join(actions.get("prefer_ops", [])) if actions else ""
-        avoid_ops = ", ".join(actions.get("avoid_ops", [])) if actions else ""
+        avoid_ops  = ", ".join(actions.get("avoid_ops", [])) if actions else ""
 
         lines = [
-            "## Directional Guidance (Linear-DDO)",
-            f"Regime: {regime}. Aim: Acc↑, Lat↓, Params↓.",
-            f"Target: acc {cur_acc:.4f} → ≥ {tar_acc:.4f}; params ≤ {budget:.0f}.",
+            "## Directional Guidance",
+            f"Aim: Acc↑, Time↓.",
+            f"Target: acc {cur_acc:.4f} → ≥ {tar_acc:.4f}; infer_time_s ≤ {budget:.6f}.",
             f"Trust-region step: {step:.2f} → edit budget: {max(1, min(4, int(round(1 + 3 * step))))}.",
         ]
         if prefer_ops: lines.append("**Preferred ops/knobs:** " + prefer_ops)
         if avoid_ops:  lines.append("**Avoid patterns:** " + avoid_ops)
         return "\n".join(lines)
 
+
     def _has_core_metrics(self, prog: dict) -> bool:
         m = (prog or {}).get("metrics", {}) or {}
-        return any(k in m for k in ("acc", "accuracy", "top1", "latency_ms", "infer_time_s", "params", "macs", "flops"))
+        if any(k in m for k in ("acc", "accuracy", "top1", "infer_time_s")):
+            return True
+        r = (prog or {}).get("resources", {}) or {}
+        return "infer_time_s" in r
 
     def _select_anchor(self, cur: dict, history: list, prev: list, top: list, cfg: dict):
         # 0) 组候选池（带核心指标）；没有就把当前点放进去
@@ -780,26 +809,20 @@ class PromptSampler:
         frontier = self._pareto_frontier(pool)
         stats = self._robust_norm_stats(pool + [cur])
         Fh = [self._normalize_obj(self._obj_vec(p), stats) for p in frontier]
-        Z = list(map(min, zip(*Fh))) if Fh else [0.0, 0.0, 0.0]
+        Z = list(map(min, zip(*Fh))) if Fh else [0.0, 0.0]
 
-        regime = self._ai_regime(cur, cfg)
-        base_w = cfg.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3})
-        W = self._regime_aware_weights(base_w, regime)
+        base_w = cfg.get("weights", {"perf": 1.0, "latency": 0.5})
+        W = {"perf": float(base_w.get("perf", 1.0)), "latency": float(base_w.get("latency", 0.5))}
         crowd = self._crowding_distance(frontier, stats)
-
-        Mb = float(cfg.get("ai_mb_threshold", 32.0))
-        ai_cur = self._ai_proxy(cur)
 
         best, bestU = None, -1e18
         for p in frontier:
             pid = p.get("id", "p")
             fhat = self._normalize_obj(self._obj_vec(p), stats)
+            # 2-D Tchebychev：perf(=acc) & latency(=time)
             tche = max(W["perf"] * abs(fhat[0] - Z[0]),
-                       W["latency"] * abs(fhat[1] - Z[1]),
-                       W["params"] * abs(fhat[2] - Z[2]))
-            ai_p = self._ai_proxy(p)
-            ai_term = (abs(ai_cur - Mb) - abs(ai_p - Mb))  # closer-to-Mb is rewarded
-            U = -tche + 0.2 * crowd.get(pid, 0.0) + 0.1 * ai_term
+                       W["latency"] * abs(fhat[1] - Z[1]))
+            U = -tche + 0.2 * crowd.get(pid, 0.0)
             if U > bestU:
                 bestU, best = U, p
 

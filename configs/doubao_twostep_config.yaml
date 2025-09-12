@@ -121,7 +121,7 @@ database:
 # Evaluator configuration
 evaluator:
   # General settings
-  timeout: 300                        # Maximum evaluation time in seconds
+  timeout: 100                        # Maximum evaluation time in seconds
   max_retries: 3                      # Maximum number of retries for evaluation
 
   # Note: resource limits (memory_limit_mb, cpu_limit) are not yet implemented
@@ -146,31 +146,20 @@ direction_feedback:
   enabled: True
   frequency: 1
   warmup_k: 3
+  bootstrap_params_default: 30730
+  bootstrap_flops_default: 30720
   k_window: 8
   ema_decay: 0.8
   stagnation_k: 6
   epsilon: 0.01
   max_df_lines: 12
   ai_mb_threshold: 32
-  allowed_ops:
-    - "elementwise multiply + sum ( (a * b).sum() )"
-    - "tile_size ∈ {128,256} on input-dim"
-    - "unroll ∈ {2,4,8} on output-dim"
-    - "bias_outside_inner_loop"
-    - "accumulator_in_register"
-    - "index via out[b, j] (no view assignment)"
-  forbidden_patterns:
-    - "torch.dot"
-    - "torch.mm / torch.mv / torch.matmul / @ / einsum / bmm"
-    - "innermost loop over B (batch dimension)"
-    - "write through a view (e.g., out_b = out[b]; out_b[j] = ...)"
-  weights: { perf: 1.0, latency: 0.5, params: 0.3 }
+  weights: { perf: 1.0, latency: 0.5 }
   # --- 新增项（可选） ---
-  metric_keys: ["acc", "latency_ms", "params"]
-  resource_tolerances: { params_pct: 0.10, flops_pct: 0.20, mem_pct: 0.15 }
+  metric_keys: ["acc", "infer_time_s"]
+  resource_tolerances: { infer_time_pct: 0.10 }
   stagnation: { k: 5, slope_eps: 1.0e-3 }
   diversify_penalty_cos: 0.92
   actions:
-    prefer_ops: ["addmv"]         # 等价于你原来的 allowed_ops
-    avoid_ops: ["mm", "dot"]      # 等价于你原来的 forbidden_patterns
+    prefer_ops: ["lowrank","groups","sparsify","two_layer_mlp"]      # 等价于你原来的 allowed_ops
     max_param_increase_pct: 0.05

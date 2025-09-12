@@ -590,15 +590,28 @@ class ProcessParallelController:
                         )
                         logger.info(f"Metrics: {metrics_str}")
 
-                        if not hasattr(self, "_warned_about_combined_score"):
-                            self._warned_about_combined_score = False
-                        if "combined_score" not in child_program.metrics and not self._warned_about_combined_score:
-                            avg_score = safe_numeric_average(child_program.metrics)
+                        # if not hasattr(self, "_warned_about_combined_score"):
+                        #     self._warned_about_combined_score = False
+                        # if "combined_score" not in child_program.metrics and not self._warned_about_combined_score:
+                        #     avg_score = safe_numeric_average(child_program.metrics)
+                        #     logger.warning(
+                        #         f"⚠️  No 'combined_score' in metrics; using safe average ({avg_score:.4f}) for guidance. "
+                        #         f"Consider returning a proper 'combined_score' in evaluator."
+                        #     )
+                        #     self._warned_about_combined_score = True
+                        # 如果 evaluator 没给 combined_score，这里强制兜底，避免 timeout 样本被误判为 best
+                        if "combined_score" not in child_program.metrics:
+                            # timeout 或 error 直接给极低分；否则也给很低的惩罚分
+                            m = child_program.metrics
+                            timed_out = bool(m.get("timeout"))
+                            has_error = bool(m.get("error"))
+                            fallback = -1e9 if (timed_out or has_error) else -1e6
+                            child_program.metrics["combined_score"] = fallback
                             logger.warning(
-                                f"⚠️  No 'combined_score' in metrics; using safe average ({avg_score:.4f}) for guidance. "
-                                f"Consider returning a proper 'combined_score' in evaluator."
+                                "⚠️  No 'combined_score' in metrics; assigned fallback %.1f (timeout=%s, error=%s). "
+                                "Consider returning a proper 'combined_score' in evaluator.",
+                                fallback, timed_out, has_error
                             )
-                            self._warned_about_combined_score = True
 
                     if self.database.best_program_id == child_program.id:
                         logger.info(f"🌟 New best solution found at iteration {completed_iteration}: {child_program.id}")
@@ -623,7 +636,7 @@ class ProcessParallelController:
                         if metric_name in child_program.metrics:
                             current_score = child_program.metrics[metric_name]
                         elif metric_name == "combined_score":
-                            current_score = safe_numeric_average(child_program.metrics)
+                            current_score = -1e9  # 缺 combined_score 就给极低值，防止误触早停
                         else:
                             logger.warning(
                                 f"Early stopping metric '{metric_name}' not found; using safe numeric average"

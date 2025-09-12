@@ -28,10 +28,11 @@ class AnchorManager:
         self.cfg = config or {}
 
         # 可调权重/阈值（提供缺省）
-        dcfg = self.cfg.get("directional_feedback", {})
+        dcfg = self.cfg.get("direction_feedback") or self.cfg.get("directional_feedback", {})
+
         self.metric_keys = dcfg.get("metric_keys", ["acc", "latency_ms", "params"])
         self.resource_tol = dcfg.get("resource_tolerances",
-                                     {"params_pct": 0.1, "flops_pct": 0.2, "mem_pct": 0.15})
+                                     {"params_pct": 0.1, "flops_pct": 0.2, "mem_pct": 0.15, "infer_time_pct": 0.10})
         self.weights = dcfg.get("weights", {"perf": 1.0, "latency": 0.5, "params": 0.3})
         self.stag = dcfg.get("stagnation", {"k": 5, "slope_eps": 1e-3})
         self.diverse_penalty_cos = dcfg.get("diversify_penalty_cos", 0.92)
@@ -86,6 +87,11 @@ class AnchorManager:
             r = p.get("resources", {})
             if not self._resource_close(cur_r, r):  # 资源相近
                 continue
+            if not self._resource_close(cur_r, r):
+                continue
+            if not self._latency_close(cur.get("metrics", {}), p.get("metrics", {})):
+                continue
+
             acc_gain = p["metrics"].get("acc", 0) - cur["metrics"].get("acc", 0)
             if acc_gain > best_acc_gain:
                 best_acc_gain = acc_gain; best = p
@@ -182,6 +188,13 @@ class AnchorManager:
                       metrics=p.get("metrics", {}),
                       resources=p.get("resources", {}),
                       features=p.get("features", {}))
+
+    def _latency_close(self, a_m: Dict[str, float], b_m: Dict[str, float]) -> bool:
+        pct = float(self.resource_tol.get("infer_time_pct", 0.10))
+        if "latency_ms" not in a_m or "latency_ms" not in b_m:
+            return False
+        denom = max(1e-9, a_m["latency_ms"])
+        return abs(a_m["latency_ms"] - b_m["latency_ms"]) / denom <= pct
 
     def _resource_close(self, a: Dict[str, float], b: Dict[str, float]) -> bool:
         def ok(key, pct):

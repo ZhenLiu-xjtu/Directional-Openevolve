@@ -136,7 +136,7 @@ class DirectionFeedbackResourceTolerances:
     params_pct: float = 0.10
     flops_pct: float = 0.20
     mem_pct: float = 0.15
-
+    infer_time_pct: float = 0.10  # ← 新增：时间容差
 @dataclass
 class DirectionFeedbackStagnation:
     k: int = 5
@@ -189,7 +189,7 @@ class DirectionFeedbackConfig:
     actions: DirectionFeedbackActions = field(
         default_factory=DirectionFeedbackActions
     )
-
+    infer_time_pct: float = 0.10  # ← 新增：时间容差
     def __post_init__(self):
         """
         向后兼容：
@@ -275,7 +275,8 @@ class EvaluatorConfig:
     llm_feedback_weight: float = 0.1
     enable_artifacts: bool = True
     max_artifact_storage: int = 100 * 1024 * 1024
-
+    bootstrap_params_default: int = 30730
+    bootstrap_flops_default: int = 30720
     # ---- 新增：评测预算参数（可用来快速降低 timeout 概率）----
     max_steps: Optional[int] = None            # e.g. 20
     max_train_batches: Optional[int] = None    # e.g. 20
@@ -456,6 +457,7 @@ class Config:
                     "params_pct": self.direction_feedback.resource_tolerances.params_pct,
                     "flops_pct": self.direction_feedback.resource_tolerances.flops_pct,
                     "mem_pct": self.direction_feedback.resource_tolerances.mem_pct,
+                    "infer_time_pct": self.direction_feedback.resource_tolerances.infer_time_pct,  # ← 新增
                 },
                 "stagnation": {
                     "k": self.direction_feedback.stagnation.k,
