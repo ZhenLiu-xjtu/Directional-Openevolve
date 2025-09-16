@@ -593,54 +593,175 @@ class PromptSampler:
             "bootstrap_infer_time_default": cfg_dir.get("bootstrap_infer_time_default", 0.0),
         }
 
-
     def _m(self, prog: dict, key: str, default=0.0):
-        """安全获取 metrics 的键；支持常见别名"""
+        """
+        取 metrics 中的值（带常见别名），同时：
+        - 兼容嵌套结构：metrics 里再套一层 "metrics"
+        - 正确处理秒/毫秒单位的互转
+        - 取不到再回退到 resources
+        """
+        # 1) 拿到 metrics，并把内层 metrics 扁平化合并（外层键优先保留）
         m = (prog or {}).get("metrics", {}) or {}
-        alias = {
-            "acc": ["acc", "accuracy", "top1", "top1_acc"],
-            "infer_time_s": ["infer_time_s", "infer_times_s", "latency_s"],  # 接受你提到的拼写变体
-            "latency_ms": ["latency_ms", "infer_time_ms"],  # 仅为兼容旧日志
-            "combined_score": ["combined_score"],
-        }
+        if isinstance(m.get("metrics"), dict):
+            inner = m["metrics"]
+            m = {**inner, **{k: v for k, v in m.items() if k != "metrics"}}
 
-        keys = alias.get(key, [key])
-        for k in keys:
-            v = m.get(k, None)
-            if v is None and k.endswith("_s"):
-                # 秒 -> 毫秒
-                try:
-                    v = float(m.get(k, 0.0)) * 1000.0
-                except Exception:
-                    pass
-            if v is not None:
-                try: return float(v)
-                except Exception: return v
-        # 资源类也可能放在 resources 里
-        if key in ("params", "flops", "mem_mb", "infer_time_s"):
+        # 2) 特殊键：acc（别名很多）
+        if key == "acc":
+            for k in ("acc", "top1", "accuracy", "top1_acc"):
+                if k in m:
+                    try:
+                        return float(m[k])
+                    except Exception:
+                        return m[k]
+            return default
+
+        # 3) 特殊键：推理时间（秒），优先秒，其次把毫秒换算为秒
+        if key == "infer_time_s":
+            for k in ("infer_time_s", "latency_s"):
+                if k in m:
+                    return float(m[k])
+            for k in ("latency_ms", "infer_time_ms"):
+                if k in m:
+                    return float(m[k]) / 1000.0
+            # 资源回退
             r = (prog or {}).get("resources", {}) or {}
-            v = r.get(key, None)
-            if v is not None:
-                try: return float(v)
-                except Exception: return v
+            if "infer_time_s" in r:
+                return float(r["infer_time_s"])
+            if "latency_ms" in r:
+                return float(r["latency_ms"]) / 1000.0
+            return default
+
+        # 4) 其它资源类键：先看 metrics，再看 resources
+        if key in ("params", "flops", "macs", "mem_mb"):
+            if key in m:
+                return float(m[key])
+            r = (prog or {}).get("resources", {}) or {}
+            if key in r:
+                return float(r[key])
+            # flops/macs 互通
+            if key in ("flops", "macs"):
+                if "macs" in m: return float(m["macs"])
+                if "macs" in r: return float(r["macs"])
+            return default
+
+        # 5) 其它通用别名（保持兼容）
+        alias = {
+            "combined_score": ("combined_score", "score"),
+            "latency_ms": ("latency_ms", "infer_time_ms"),
+            "top1": ("top1", "acc", "accuracy"),
+        }
+        for k in alias.get(key, (key,)):
+            if k in m:
+                try:
+                    return float(m[k])
+                except Exception:
+                    return m[k]
+
+        # 6) 最后再试试 resources
+        r = (prog or {}).get("resources", {}) or {}
+        if key in r:
+            try:
+                return float(r[key])
+            except Exception:
+                return r[key]
         return default
 
+    def _to_float(self, v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    def _flatten_metrics(self, prog: dict) -> dict:
+        m = (prog or {}).get("metrics", {}) or {}
+        if isinstance(m.get("metrics"), dict):  # 扁平化内层
+            inner = m["metrics"]
+            m = {**inner, **{k: v for k, v in m.items() if k != "metrics"}}
+        return m
+
     def _r(self, prog: dict, key: str, default=0.0):
-        """安全获取 resources 的键"""
-        r = (prog or {}).get("resources", {}) or {}
-        v = r.get(key, None)
-        if v is None and key in ("flops", "macs"):
-            v = (prog or {}).get("metrics", {}).get("macs", None)
-        return float(v) if isinstance(v, (int, float)) else (v if v is not None else default)
+        """
+        安全读取资源/指标：
+        - 先看 resources，再看 metrics（含内层 metrics）
+        - 支持常见别名与单位换算（s↔ms）
+        """
+        p = prog or {}
+        r = (p.get("resources") or {}) if isinstance(p.get("resources"), dict) else {}
+        m = self._flatten_metrics(p)
+
+        def pick(*keys):
+            for k in keys:
+                if k in r:
+                    return r[k]
+                if k in m:
+                    return m[k]
+            return None
+
+        # 时间（秒）：优先秒，其次把毫秒换算为秒
+        if key in ("infer_time_s", "latency_s"):
+            v = pick("infer_time_s", "latency_s")
+            if v is None:
+                v_ms = pick("latency_ms", "infer_time_ms")
+                if v_ms is not None:
+                    v = self._to_float(v_ms)
+                    if v is not None:
+                        v = v / 1000.0
+            vf = self._to_float(v)
+            return vf if vf is not None else default
+
+        # flops/macs 互通
+        if key in ("flops", "macs"):
+            v = pick("flops", "macs")
+            vf = self._to_float(v)
+            return vf if vf is not None else default
+
+        # 参数
+        if key in ("params", "parameters", "n_params"):
+            v = pick("params", "parameters", "n_params")
+            vf = self._to_float(v)
+            return vf if vf is not None else default
+
+        # 显存/内存
+        if key in ("mem_mb", "memory_mb", "mem"):
+            v = pick("mem_mb", "memory_mb", "mem")
+            vf = self._to_float(v)
+            return vf if vf is not None else default
+
+        # 其它键的通用兜底
+        v = pick(key)
+        vf = self._to_float(v)
+        return vf if vf is not None else default
 
     def _resource_close(self, a: dict, b: dict, tol: dict) -> bool:
-        def ok_time(pct):
-            av = self._r(a, "infer_time_s", None); bv = self._r(b, "infer_time_s", None)
-            if av is None or bv is None:
+        """
+        在对称相对误差容差内判断“同资源”：
+          |a-b| / max(a,b,1e-9) <= pct
+        默认同时检查 params / flops(macs) / mem_mb / infer_time_s；
+        你也可以只保留时间判定。
+        """
+        pct_params = float(tol.get("params_pct", 0.10))
+        pct_flops = float(tol.get("flops_pct", 0.20))
+        pct_mem = float(tol.get("mem_pct", 0.15))
+        pct_time = float(tol.get("infer_time_pct", 0.10))
+
+        def rel_close(get_key, pct):
+            va = self._r(a, get_key, None)
+            vb = self._r(b, get_key, None)
+            if va is None or vb is None:
                 return False
-            denom = max(1e-9, float(av))
-            return abs(float(av) - float(bv)) / denom <= pct
-        return ok_time(tol.get("infer_time_pct", 0.10))
+            va = float(va);
+            vb = float(vb)
+            denom = max(1e-9, va, vb)  # 对称归一化，避免 a=0 的极端
+            return abs(va - vb) / denom <= pct
+
+        # 如需只按时间：return rel_close("infer_time_s", pct_time)
+        return (
+                rel_close("params", pct_params) and
+                rel_close("macs", pct_flops) and  # _r 会让 flops/macs 互通
+                rel_close("mem_mb", pct_mem) and
+                rel_close("infer_time_s", pct_time)
+        )
 
 
     def _pick_same_resource_anchor(self, cur: dict, candidates: list, tol: dict):
@@ -681,8 +802,10 @@ class PromptSampler:
         return (acc1 - acc0) < float(eps)
 
     def _hallucinated_anchor(self, cur: dict, history: list, k: int, max_param_inc_pct: float):
+        # print("cur:",cur)
         cur_acc = self._m(cur, "acc", 0.0)
         cur_time = self._m(cur, "infer_time_s", 0.0)
+        # print("cur_acc:",cur_acc,cur_time)
         if cur_time <= 0.0:
             cur_time = self._r(cur, "infer_time_s", 0.0)
         if cur_time <= 0.0:

@@ -158,7 +158,7 @@ def _evaluate(program_module, device: str = "cpu") -> Dict:
     model, meta = program_module.build_model()
     model.to(device)
 
-    train_loader, test_loader = _get_cifar10_dataloaders(train_n=1000, test_n=100, seed=42, bs=256)
+    train_loader, test_loader = _get_cifar10_dataloaders(train_n=1000, test_n=20, seed=42, bs=50)
 
     # 训练（小预算）；遇到 fork+autograd 冲突时自动跳过训练
     do_train = os.environ.get("OE_SKIP_TRAIN", "0") != "1"

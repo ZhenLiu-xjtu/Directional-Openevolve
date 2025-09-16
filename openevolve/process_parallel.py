@@ -405,6 +405,8 @@ class ProcessParallelController:
         logger.info("Graceful shutdown requested...")
         self.shutdown_event.set()
 
+
+
     def _create_database_snapshot(self) -> Dict[str, Any]:
         snapshot = {
             "programs": {pid: prog.to_dict() for pid, prog in self.database.programs.items()},
@@ -427,6 +429,7 @@ class ProcessParallelController:
         target_score: Optional[float] = None,
         checkpoint_callback=None,
     ):
+
         if not self.executor:
             raise RuntimeError("Process pool not started")
 
@@ -470,6 +473,41 @@ class ProcessParallelController:
             )
         else:
             logger.info("Early stopping disabled")
+
+        # —— 放在 run_evolution(...) 里，主 while 前 —— #
+        def _can_submit_more() -> bool:
+            # 全局限流：总 pending 不超过 worker 数
+            return len(pending_futures) < self.num_workers and not self.shutdown_event.is_set()
+
+        def _submit_one_for_island(isl: int) -> bool:
+            nonlocal next_iteration  # 需要修改外层的 next_iteration 计数
+            if next_iteration >= total_iterations:
+                return False
+            fut = self._submit_iteration(next_iteration, isl)
+            if not fut:
+                return False
+            pending_futures[next_iteration] = fut
+            island_pending[isl].append(next_iteration)
+            next_iteration += 1
+            return True
+
+        def _fill_pending_round_robin():
+            """
+            轮询各岛，直到 pending 数量达到 worker 上限或任务发完。
+            这是我们推荐的“补货”函数——用它替代以前的 per-island 批量灌任务。
+            """
+            progressed = True
+            while _can_submit_more() and next_iteration < total_iterations and progressed:
+                progressed = False
+                for isl in range(self.num_islands):
+                    if not _can_submit_more() or next_iteration >= total_iterations:
+                        break
+                    if _submit_one_for_island(isl):
+                        progressed = True
+
+        # （可选）若你想保留之前的名字，就再加一个薄包装：
+        def _resubmit_after_restart():
+            _fill_pending_round_robin()
 
         while (
             pending_futures
@@ -590,28 +628,15 @@ class ProcessParallelController:
                         )
                         logger.info(f"Metrics: {metrics_str}")
 
-                        # if not hasattr(self, "_warned_about_combined_score"):
-                        #     self._warned_about_combined_score = False
-                        # if "combined_score" not in child_program.metrics and not self._warned_about_combined_score:
-                        #     avg_score = safe_numeric_average(child_program.metrics)
-                        #     logger.warning(
-                        #         f"⚠️  No 'combined_score' in metrics; using safe average ({avg_score:.4f}) for guidance. "
-                        #         f"Consider returning a proper 'combined_score' in evaluator."
-                        #     )
-                        #     self._warned_about_combined_score = True
-                        # 如果 evaluator 没给 combined_score，这里强制兜底，避免 timeout 样本被误判为 best
-                        if "combined_score" not in child_program.metrics:
-                            # timeout 或 error 直接给极低分；否则也给很低的惩罚分
-                            m = child_program.metrics
-                            timed_out = bool(m.get("timeout"))
-                            has_error = bool(m.get("error"))
-                            fallback = -1e9 if (timed_out or has_error) else -1e6
-                            child_program.metrics["combined_score"] = fallback
+                        if not hasattr(self, "_warned_about_combined_score"):
+                            self._warned_about_combined_score = False
+                        if "combined_score" not in child_program.metrics and not self._warned_about_combined_score:
+                            avg_score = safe_numeric_average(child_program.metrics)
                             logger.warning(
-                                "⚠️  No 'combined_score' in metrics; assigned fallback %.1f (timeout=%s, error=%s). "
-                                "Consider returning a proper 'combined_score' in evaluator.",
-                                fallback, timed_out, has_error
+                                f"⚠️  No 'combined_score' in metrics; using safe average ({avg_score:.4f}) for guidance. "
+                                f"Consider returning a proper 'combined_score' in evaluator."
                             )
+                            self._warned_about_combined_score = True
 
                     if self.database.best_program_id == child_program.id:
                         logger.info(f"🌟 New best solution found at iteration {completed_iteration}: {child_program.id}")
@@ -636,7 +661,7 @@ class ProcessParallelController:
                         if metric_name in child_program.metrics:
                             current_score = child_program.metrics[metric_name]
                         elif metric_name == "combined_score":
-                            current_score = -1e9  # 缺 combined_score 就给极低值，防止误触早停
+                            current_score = safe_numeric_average(child_program.metrics)
                         else:
                             logger.warning(
                                 f"Early stopping metric '{metric_name}' not found; using safe numeric average"
@@ -663,9 +688,40 @@ class ProcessParallelController:
             except FutureTimeoutError:
                 logger.error(
                     f"⏰ Iteration {completed_iteration} timed out after {timeout_seconds}s "
-                    f"(evaluator timeout: {self.config.evaluator.timeout}s + 30s buffer). Canceling future."
+                    f"(evaluator timeout: {self.config.evaluator.timeout}s + 30s buffer). "
+                    f"Canceling future and restarting process pool to avoid worker leakage."
                 )
-                future.cancel()
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+                try:
+                    if self.executor:
+                        self.executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                import multiprocessing as mp
+                from concurrent.futures import ProcessPoolExecutor
+                ctx = mp.get_context("spawn")
+                self.executor = ProcessPoolExecutor(
+                    max_workers=self.num_workers,
+                    mp_context=ctx,
+                    initializer=_worker_init,
+                    initargs=(self._serialize_config(self.config), self.evaluation_file, dict(os.environ)),
+                )
+                logger.warning("🔁 Process pool restarted due to timeout. Resubmitting pending iterations.")
+                # 3) 清空所有 pending 的映射与每个岛的队列，释放对“大快照”的引用
+                pending_futures.clear()
+                for isl in island_pending:
+                    island_pending[isl].clear()
+
+                # 4) 重新按配额投递新任务（见第 3 节“限流”改法）
+                _resubmit_after_restart()
+
+                # 5) 触发一次 GC，及时回收大对象
+                import gc;
+                gc.collect()
+                continue
             except Exception as e:
                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
 
