@@ -119,31 +119,58 @@ class LinearLoopLayer(nn.Module):
 
 
 class CandidateNet(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_dim: int = 0):
         super().__init__()
-        # Sensible defaults for CIFAR-10 (in=3072, out=10):
-        # - lowrank_rank should be small (<= out) to really cut MACs.
-        # - start with rank=4; let evolution tune {r in [2..10]}, groups, sparsity.
-        self.fc = LinearLoopLayer(IN_DIM, NUM_CLASSES,
-                                  bias=True,
-                                  lowrank_rank=0,   # start small to reduce MACs; LLM can mutate it
-                                  groups=1,
-                                  sparsity=1.0)
+        self.hidden_dim = int(hidden_dim)
+        if self.hidden_dim > 0:
+            # 两层：in -> H -> out，仍使用你的 for-loop 线性层
+            self.fc1 = LinearLoopLayer(IN_DIM, self.hidden_dim, bias=True,
+                                       lowrank_rank=0, groups=1, sparsity=1.0)
+            self.act = nn.ReLU(inplace=True)
+            self.fc2 = LinearLoopLayer(self.hidden_dim, NUM_CLASSES, bias=True,
+                                       lowrank_rank=0, groups=1, sparsity=1.0)
+        else:
+            # 单层基线
+            self.fc = LinearLoopLayer(IN_DIM, NUM_CLASSES, bias=True,
+                                      lowrank_rank=0, groups=1, sparsity=1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x)
+        if x.dim() == 4:
+            b = x.size(0)
+            x = x.view(b, -1)
+        if self.hidden_dim > 0:
+            return self.fc2(self.act(self.fc1(x)))
+        else:
+            return self.fc(x)
 
+
+
+from typing import Tuple, Dict
 
 def build_model() -> Tuple[nn.Module, Dict]:
-    model = CandidateNet()
-    meta = {
-        "hyperparams": {
-            "in_dim": IN_DIM,
-            "num_classes": NUM_CLASSES,
-            "hidden_dim": 0,          # 0 => single stage
-            "lowrank_rank": 0,        # MUST match model init above so evaluator can account MACs
-            "groups": 1,
-            "sparsity": 1.0
-        }
-    }
+    # 默认 H=0；进化/提示可调整为 64/128 等
+    model = CandidateNet(hidden_dim=0)
+
+    # 从模型对象读取参数，自动写回 meta，保证评测方与实现一致
+    hp = {}
+    hp["in_dim"] = IN_DIM
+    hp["num_classes"] = NUM_CLASSES
+    hp["hidden_dim"] = int(getattr(model, "hidden_dim", 0) or 0)
+
+    # 读取 for-loop 线性层上的超参（如果是两层，取第一层；按需也可汇总）
+    if hp["hidden_dim"] > 0 and hasattr(model, "fc1"):
+        fc_like = model.fc1
+    else:
+        fc_like = getattr(model, "fc", None)
+
+    if fc_like is not None:
+        hp["lowrank_rank"] = int(getattr(fc_like, "rank", 0) or 0)
+        hp["groups"] = int(getattr(fc_like, "groups", 1) or 1)
+        hp["sparsity"] = float(getattr(fc_like, "sparsity", 1.0))
+    else:
+        hp["lowrank_rank"] = 0
+        hp["groups"] = 1
+        hp["sparsity"] = 1.0
+
+    meta = {"hyperparams": hp}
     return model, meta
